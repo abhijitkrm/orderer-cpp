@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test.sh
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        san: [address, thread]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DORDERER_SANITIZE=${{ matrix.san }}
+      - run: cmake --build build -j
+      - run: cd build && ctest --output-on-failure
+
+  # Private sibling repos need a token with read access to them
+  # (secrets.ORDERER_REPO_TOKEN); public ones work with the default token.
+  vendored:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          fetch-depth: 0
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - run: UPSTREAM_DIR=upstream/orderer scripts/vendored.sh
+
+  # Both axes: orderer-cpp vs orderer-rust and vs matcher-cpp, via the spec repo's scripts.
+  cross-impl:
+    runs-on: ubuntu-latest
+    env:
+      ORDERER_CPP_DIR: ${{ github.workspace }}
+      ORDERER_RUST_DIR: ${{ github.workspace }}/upstream/orderer-rust
+      MATCHER_CPP_DIR: ${{ github.workspace }}/upstream/matcher-cpp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer-rust
+          path: upstream/orderer-rust
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/matcher-cpp
+          ref: 5ddb7d2c2deb2e72b2d9a7fc09e27293bb2511b1
+          path: upstream/matcher-cpp
+      - uses: dtolnay/rust-toolchain@stable
+      - run: upstream/orderer/scripts/diffuzz.sh 4 10000
+      - run: upstream/orderer/scripts/e2e.sh
+      - run: upstream/orderer/scripts/snapdiff.sh
