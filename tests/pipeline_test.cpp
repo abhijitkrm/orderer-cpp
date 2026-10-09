@@ -545,7 +545,7 @@ TEST(stats_count_commands_events_and_fsyncs) {
     p->drain();
     auto deadline = std::chrono::steady_clock::now() + 10s;
     auto lagging = [&] {
-        for (auto& s : p->stats().partitions) if (s.durable_iseq < s.flushed_iseq) return true;
+        for (auto& s : p->stats().partitions) if (s.fsyncs == 0 || s.durable_iseq < s.flushed_iseq) return true;
         return false;
     };
     while (lagging() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
