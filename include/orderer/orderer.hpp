@@ -9,3 +9,4 @@
 #include "pipeline.hpp"
 #include "recover.hpp"
 #include "routing.hpp"
+#include "stats.hpp"

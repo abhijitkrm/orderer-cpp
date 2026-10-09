@@ -51,6 +51,7 @@ The full version is `examples/quickstart.cpp` (CMake target `quickstart`).
 | Journals | `JournalConfig`, `FsyncPolicy` | JSONL or binary, group-commit fsync on I/O threads |
 | Waiting | `Waits` / `disruptor::WaitStrategy` | BusySpin, Yield, Backoff, Blocking |
 | Recovery | `recover<C>(…)`, `read_snapshot`, `restore<C>`, `repair_dir` | snapshot + journals → cores at any P; torn tails repaired |
+| Observability | `Pipeline::stats()`, `PipelineStats::to_prometheus()` | ring depths, counters, watermarks, fsync timings |
 | Checkpoints | `Pipeline::checkpoint()` | durable snapshot + journal segment rotation; old segments removed |
 
 ## Build, test, harness

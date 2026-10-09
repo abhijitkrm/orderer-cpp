@@ -536,6 +536,36 @@ TEST(automatic_checkpoints_keep_the_directory_recoverable) {
     CHECK(threw) << "needs journals";
 }
 
+TEST(stats_count_commands_events_and_fsyncs) {
+    auto cfg = fuzz_cfg();
+    auto cmds = fuzz_corpus(16, 5000, 6);
+    auto dir = scratch(SCRATCH, "stats");
+    auto p = Pipeline<FifoCore>::builder().book_config(cfg).partitions(3).journal(jcfg(dir, JournalFormat::Binary)).build();
+    p->publish_batch(cmds);
+    p->drain();
+    auto deadline = std::chrono::steady_clock::now() + 10s;
+    auto lagging = [&] {
+        for (auto& s : p->stats().partitions) if (s.durable_iseq < s.flushed_iseq) return true;
+        return false;
+    };
+    while (lagging() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(5ms);
+    auto st = p->stats();
+    CHECK(st.ingress_depth == 0 && st.partitions.size() == 3);
+    std::uint64_t commands = 0, events = 0, durable = 0;
+    for (auto& s : st.partitions) {
+        CHECK(s.inbox_depth == 0 && s.outbox_depth == 0);
+        CHECK(s.fsyncs > 0 && s.fsync_ns_max > 0) << "partition " << s.partition;
+        commands += s.commands;
+        events += s.events;
+        durable = std::max(durable, s.durable_iseq);
+    }
+    CHECK(commands == cmds.size() && events == reference_lines(cfg, cmds).size() && durable == cmds.size());
+    auto prom = st.to_prometheus();
+    CHECK(prom.find("# TYPE orderer_commands_total counter") != std::string::npos);
+    CHECK(prom.find("orderer_inbox_depth{partition=\"2\"} 0") != std::string::npos);
+    p->shutdown();
+}
+
 int main(int argc, char** argv) {
     SCRATCH = argc > 2 ? argv[2] : "build/scratch";
     fs::create_directories(SCRATCH);

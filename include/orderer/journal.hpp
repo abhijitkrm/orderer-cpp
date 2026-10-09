@@ -25,6 +25,7 @@
 
 #include "core.hpp"
 #include "flat.hpp"
+#include "stats.hpp"
 
 namespace orderer {
 
@@ -686,6 +687,7 @@ inline int durable_sync(int fd) {
 /// Watermarks an I/O thread advances.
 struct Marks {
     std::shared_ptr<std::atomic<std::uint64_t>> flushed, durable;
+    std::shared_ptr<IoStats> io = std::make_shared<IoStats>();
 };
 
 /// Asynchronous journal writer: the owning thread encodes into a chunk (a
@@ -802,7 +804,10 @@ class ChunkWriter {
         }
     }
     void sync(std::uint64_t written) {
+        auto t0 = std::chrono::steady_clock::now();
         if (!error_ && durable_sync(fd_) != 0) error_ = std::string("journal fsync: ") + std::strerror(errno);
+        marks_.io->record(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count()));
         if (!error_) marks_.durable->store(written, std::memory_order_release);
     }
 

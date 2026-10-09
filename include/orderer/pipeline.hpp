@@ -112,6 +112,8 @@ struct Shared {
     std::condition_variable snaps_cv;
     std::map<std::uint64_t, SnapState> snaps;
     std::vector<std::shared_ptr<std::atomic<std::uint64_t>>> flushed, durable;
+    std::vector<std::shared_ptr<IoStats>> io;
+    std::vector<std::shared_ptr<EngineCounters>> counters;
     std::optional<JournalConfig> journal;
     std::mutex alerts_m;  // threads may fail while later rings are still registering
     std::vector<std::function<void()>> alerts;
@@ -324,6 +326,28 @@ class Pipeline {
     /// into the journal directory; older segments and checkpoints go.
     Snapshot checkpoint() { return checkpoint_on(*handle_); }
 
+    /// Operational statistics (stats.hpp).
+    PipelineStats stats() const {
+        auto depth = [](std::int64_t pub, std::int64_t con) { return pub > con ? std::uint64_t(pub - con) : 0; };
+        PipelineStats st;
+        if (ingress_ctl_) st.ingress_depth = depth(ingress_ctl_->published(), ingress_ctl_->consumed());
+        for (std::uint32_t p = 0; p < sh_->partitions; ++p) {
+            PartitionStats ps;
+            ps.partition = p;
+            ps.inbox_depth = depth(inbox_ctl_[p].published(), inbox_ctl_[p].consumed());
+            ps.outbox_depth = depth(outbox_ctl_[p].published(), outbox_ctl_[p].consumed());
+            ps.commands = sh_->counters[p]->commands.load(std::memory_order_relaxed);
+            ps.events = sh_->counters[p]->events.load(std::memory_order_relaxed);
+            ps.flushed_iseq = sh_->journal ? sh_->flushed[p]->load(std::memory_order_acquire) : UINT64_MAX;
+            ps.durable_iseq = sh_->durable[p]->load(std::memory_order_acquire);
+            ps.fsyncs = sh_->io[p]->fsyncs.load(std::memory_order_relaxed);
+            ps.fsync_ns_total = sh_->io[p]->fsync_ns_total.load(std::memory_order_relaxed);
+            ps.fsync_ns_max = sh_->io[p]->fsync_ns_max.load(std::memory_order_relaxed);
+            st.partitions.push_back(ps);
+        }
+        return st;
+    }
+
   private:
     Snapshot checkpoint_on(Handle& h) {
         if (!sh_->journal) throw Error(Error::Kind::Config, "checkpoint needs journals");
@@ -494,6 +518,8 @@ class Pipeline {
         for (std::uint32_t p = 0; p < P; ++p) {
             sh_->flushed.push_back(std::make_shared<std::atomic<std::uint64_t>>(start_wm));
             sh_->durable.push_back(std::make_shared<std::atomic<std::uint64_t>>(journaled ? start_wm : UINT64_MAX));
+            sh_->io.push_back(std::make_shared<IoStats>());
+            sh_->counters.push_back(std::make_shared<EngineCounters>());
         }
 
         // journals first, so I/O errors surface from build()
@@ -505,7 +531,7 @@ class Pipeline {
                 if (!jc.append) clear_journal_dir(jc.dir, jc.format);
                 for (std::uint32_t p = 0; p < P; ++p) {
                     cmd_w[p] = std::make_unique<ChunkWriter>(open_journal(jc, Kind::Cmd, p, P, b.book_), jc.fsync,
-                                                             Marks{sh_->flushed[p], sh_->durable[p]});
+                                                             Marks{sh_->flushed[p], sh_->durable[p], sh_->io[p]});
                     if (jc.events)
                         evt_w[p] = std::make_unique<ChunkWriter>(
                             open_journal(jc, Kind::Evt, p, P, b.book_), std::nullopt,
@@ -525,6 +551,7 @@ class Pipeline {
             ib.consumer({}, b.waits_.engine);
             auto [inbox, inbox_cons] = ib.build_single();
             auto ictl = inbox.control();
+            inbox_ctl_.push_back(ictl);
             sh_->add_alert([ictl]() mutable { ictl.alert(); });
             inboxes.push_back(std::move(inbox));
 
@@ -532,6 +559,7 @@ class Pipeline {
             ob.consumer({}, b.waits_.egress);
             auto [outbox, outbox_cons] = ob.build_single();
             auto octl = outbox.control();
+            outbox_ctl_.push_back(octl);
             sh_->add_alert([octl]() mutable { octl.alert(); });
 
             std::optional<JournalFormat> fmt;
@@ -539,7 +567,7 @@ class Pipeline {
             std::optional<Segmenter> seg;
             if (journaled) seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Cmd, p, P, b.book_};
             threads_.emplace_back(engine_thread, sh_, std::move(inbox_cons[0]), std::move(outbox),
-                                  std::move(cores[p]), std::move(cmd_w[p]), fmt, seg);
+                                  std::move(cores[p]), std::move(cmd_w[p]), fmt, seg, sh_->counters[p]);
 
             EgressCtx ctx{p, P, sh_->epoch, sh_->durable[p]};
             EgressPart part{p, std::move(outbox_cons[0]), {}, ctx};
@@ -560,6 +588,7 @@ class Pipeline {
         rb.consumer({}, b.waits_.router);
         auto [ingress, rcons] = rb.build_multi();
         auto gctl = ingress.control();
+        ingress_ctl_.emplace(gctl);
         sh_->add_alert([gctl]() mutable { gctl.alert(); });
         threads_.emplace_back(router_thread, sh_, std::move(rcons[0]), std::move(inboxes), map_, next_iseq);
         handle_ = std::make_unique<Handle>(std::move(ingress), sh_);
@@ -624,10 +653,12 @@ class Pipeline {
 
     static void engine_thread(std::shared_ptr<detail::Shared> sh, disruptor::Consumer<CmdMsg> inbox,
                               disruptor::SingleProducer<EvtMsg> out, C core, std::unique_ptr<ChunkWriter> journal,
-                              std::optional<JournalFormat> fmt, std::optional<Segmenter> seg) {
+                              std::optional<JournalFormat> fmt, std::optional<Segmenter> seg,
+                              std::shared_ptr<EngineCounters> counters) {
         guarded(*sh, "engine", [&] {
             auto last_handoff = std::chrono::steady_clock::now();
             bool stop = false;
+            std::uint64_t n_commands = 0, n_events = 0;
             for (;;) {
                 bool force = false;
                 std::size_t n = inbox.poll([&](const CmdMsg& m, std::int64_t, bool eob) {
@@ -638,7 +669,9 @@ class Pipeline {
                             journal->record(m.iseq);
                         }
                         const std::uint64_t iseq = m.iseq, t_pub = m.t_pub;
+                        ++n_commands;
                         core.apply(m.symbol, m.cmd, [&](Symbol s, std::uint64_t seq, const Event& ev) {
+                            ++n_events;
                             out.stage([&](EvtMsg& e) {
                                 e.iseq = iseq; e.seq = seq; e.t_pub = t_pub; e.arg = 0;
                                 e.symbol = s; e.ctl = Control::None; e.ev = ev;
@@ -676,6 +709,10 @@ class Pipeline {
                     }
                     if (eob) out.commit();
                 });
+                if (n) {
+                    counters->commands.store(n_commands, std::memory_order_relaxed);
+                    counters->events.store(n_events, std::memory_order_relaxed);
+                }
                 if (stop || inbox.is_alerted()) break;
                 if (journal && journal->pending() &&
                     (force || (n == 0 && std::chrono::steady_clock::now() - last_handoff >= std::chrono::microseconds(50)))) {
@@ -744,6 +781,9 @@ class Pipeline {
     std::unique_ptr<Handle> handle_;
     bool shut_ = false;
     std::thread ckpt_;
+    std::optional<disruptor::RingControl<CmdMsg>> ingress_ctl_;
+    std::vector<disruptor::RingControl<CmdMsg>> inbox_ctl_;
+    std::vector<disruptor::RingControl<EvtMsg>> outbox_ctl_;
     std::mutex ckpt_m_;
     std::condition_variable ckpt_cv_;
     bool ckpt_stop_ = false;
