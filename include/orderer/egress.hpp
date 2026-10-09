@@ -20,7 +20,7 @@ using namespace matcher;
 
 /// Control operations ride the rings so they cut every partition at the same
 /// point of the ingress order (spec/PIPELINE.md §6).
-enum class Control : std::uint8_t { None = 0, Barrier, Snapshot, Shutdown };
+enum class Control : std::uint8_t { None = 0, Barrier, Snapshot, Shutdown, Checkpoint };
 
 /// Ingress / inbox slot. Implementation-private layout.
 struct CmdMsg {
@@ -65,6 +65,7 @@ class Egress {
     virtual void on_batch_end() {}                // after a ring batch / before a drain completes
     virtual void on_idle() {}                     // while idle: release gated work
     virtual void on_shutdown() {}                 // once, after every event
+    virtual void on_checkpoint(std::uint64_t) {}  // a checkpoint cut passed (1.2)
 };
 
 /// Creates one Egress per partition.

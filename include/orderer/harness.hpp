@@ -164,15 +164,38 @@ inline Common common(const Args& a) {
     return c;
 }
 
+/// spec/HARNESS.md §4.1 options beyond the common ones.
+struct RunOpts {
+    bool snapshot = false;
+    std::optional<std::size_t> checkpoint_every;  // --checkpoint-every K (1.2)
+    bool durable = false;                         // --durable (1.2)
+};
+
 /// Run a corpus through a fresh pipeline (one producer, file order), drain,
 /// optionally snapshot, shut down. Returns the spec/HARNESS.md §3 listing.
 template <MatchingCore C = FifoCore>
 std::pair<std::string, std::optional<Snapshot>> run_corpus(const Corpus& corpus, const Common& c, bool tagged,
-                                                           bool snapshot) {
+                                                           RunOpts opts) {
+    const bool snapshot = opts.snapshot;
     auto [f, events] = collect(tagged);
     auto b = Pipeline<C>::builder();
     b.book_config(corpus.book).partition_map(c.map).egress(f);
-    if (c.journal) b.journal(*c.journal);
+    if (c.journal) {
+        JournalConfig j = *c.journal;
+        if (opts.durable) {
+            j.fsync = FsyncPolicy::every_n(64);
+            b.egress(acks([last = std::uint64_t(0)](std::uint32_t p, const EvtMsg& m) mutable {
+                if (m.iseq != last) {
+                    last = m.iseq;
+                    std::fprintf(stderr, "acked %u %llu\n", p, (unsigned long long)m.iseq);
+                    std::fflush(stderr);
+                }
+            }));
+        }
+        b.journal(j);
+    } else if (opts.durable || opts.checkpoint_every) {
+        die("--durable and --checkpoint-every need --journal-dir");
+    }
     std::unique_ptr<Pipeline<C>> p;
     try {
         p = b.build();
@@ -181,7 +204,17 @@ std::pair<std::string, std::optional<Snapshot>> run_corpus(const Corpus& corpus,
     }
     std::optional<Snapshot> snap;
     try {
-        if (p->publish_batch(corpus.cmds) != Status::Ok) fail("pipeline closed");
+        if (opts.checkpoint_every) {
+            std::size_t k = *opts.checkpoint_every;
+            if (k == 0) die("--checkpoint-every: K must be at least 1");
+            for (std::size_t off = 0; off < corpus.cmds.size(); off += k) {
+                std::size_t n = std::min(k, corpus.cmds.size() - off);
+                if (p->publish_batch(corpus.cmds.data() + off, n) != Status::Ok) fail("pipeline closed");
+                if (n == k) p->checkpoint();
+            }
+        } else if (p->publish_batch(corpus.cmds) != Status::Ok) {
+            fail("pipeline closed");
+        }
         p->drain();
         if (snapshot) snap = p->snapshot();
         p->shutdown();

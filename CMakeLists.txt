@@ -57,6 +57,6 @@ if(ORDERER_SANITIZE STREQUAL "")
   target_link_libraries(no_alloc_test PRIVATE orderer)
   add_test(NAME no_alloc COMMAND no_alloc_test ${CMAKE_CURRENT_BINARY_DIR}/scratch)
 endif()
-add_test(NAME vectors COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors.sh $<TARGET_FILE_DIR:orderrun> ${VEC})
+add_test(NAME conformance COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/spec/conformance.sh $<TARGET_FILE_DIR:orderrun> ${VEC})
 
 install(DIRECTORY include/orderer include/matcher DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

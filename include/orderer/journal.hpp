@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -63,13 +64,115 @@ struct CorruptJournal : std::runtime_error {
 };
 
 inline const char* kind_name(Kind k) { return k == Kind::Cmd ? "cmd" : "evt"; }
-inline constexpr std::size_t HEADER = 64, CMD_RECORD = 40, EVT_RECORD = 48;
-inline std::size_t record_size(Kind k) { return k == Kind::Cmd ? CMD_RECORD : EVT_RECORD; }
+/// Version-2 record sizes (1.2): the version-1 record + CRC-32C + 4 reserved bytes.
+inline constexpr std::size_t HEADER = 64, CMD_RECORD = 48, EVT_RECORD = 56;
+inline constexpr std::size_t CMD_RECORD_V1 = 40, EVT_RECORD_V1 = 48;
+inline constexpr std::uint16_t VERSION = 2;
+inline std::size_t record_size(Kind k, std::uint16_t version = VERSION) {
+    if (version == 1) return k == Kind::Cmd ? CMD_RECORD_V1 : EVT_RECORD_V1;
+    return k == Kind::Cmd ? CMD_RECORD : EVT_RECORD;
+}
+/// Bytes the checksum covers (the version-1 record).
+inline std::size_t payload_size(Kind k) { return k == Kind::Cmd ? CMD_RECORD_V1 : EVT_RECORD_V1; }
 
-/// spec/JOURNAL.md §1.
+/// CRC-32C (Castagnoli, reflected 0x82F63B78), spec/JOURNAL.md §2.2.
+inline std::uint32_t crc32c(const std::uint8_t* d, std::size_t n) {
+    static const std::array<std::uint32_t, 256> table = [] {
+        std::array<std::uint32_t, 256> t{};
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+            t[i] = c;
+        }
+        return t;
+    }();
+    std::uint32_t c = ~0u;
+    for (std::size_t i = 0; i < n; ++i) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+inline const char* ext_of(JournalFormat f) { return f == JournalFormat::Jsonl ? "journal" : "bin"; }
+
+/// spec/JOURNAL.md §1: the segment starting after cut `start` (0 = the base file).
+inline fs::path segment_path(const fs::path& dir, Kind k, std::uint32_t p, std::uint64_t start, JournalFormat f) {
+    std::string n = std::string(kind_name(k)) + "-" + std::to_string(p);
+    if (start) n += "." + std::to_string(start);
+    return dir / (n + "." + ext_of(f));
+}
+
 inline fs::path journal_path(const fs::path& dir, Kind k, std::uint32_t p, JournalFormat f) {
-    return dir / (std::string(kind_name(k)) + "-" + std::to_string(p) +
-                  (f == JournalFormat::Jsonl ? ".journal" : ".bin"));
+    return segment_path(dir, k, p, 0, f);
+}
+
+struct Segment {
+    std::uint32_t partition;
+    std::uint64_t start;
+    fs::path path;
+    bool operator<(const Segment& o) const {
+        return partition != o.partition ? partition < o.partition : start < o.start;
+    }
+};
+
+inline bool parse_uint(std::string_view s, std::uint64_t& out) {
+    if (s.empty() || s.size() > 20) return false;
+    std::uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        std::uint64_t nv = v * 10 + std::uint64_t(c - '0');
+        if (nv / 10 != v) return false;
+        v = nv;
+    }
+    out = v;
+    return true;
+}
+
+/// Every `k` segment in `dir`, sorted by (partition, start).
+inline std::vector<Segment> list_segments(const fs::path& dir, Kind k, JournalFormat f) {
+    std::vector<Segment> out;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return out;
+    std::string prefix = std::string(kind_name(k)) + "-", suffix = std::string(".") + ext_of(f);
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        std::string name = e.path().filename().string();
+        if (name.size() <= prefix.size() + suffix.size() || name.compare(0, prefix.size(), prefix) != 0 ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+            continue;
+        std::string_view mid(name);
+        mid = mid.substr(prefix.size(), mid.size() - prefix.size() - suffix.size());
+        auto dot = mid.find('.');
+        std::uint64_t p = 0, start = 0;
+        if (!parse_uint(mid.substr(0, dot), p) || p > UINT32_MAX) continue;
+        if (dot != std::string_view::npos && (!parse_uint(mid.substr(dot + 1), start) || start == 0)) continue;
+        out.push_back({std::uint32_t(p), start, e.path()});
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+/// spec/JOURNAL.md §6: checkpoint snapshot path for cut `n`.
+inline fs::path checkpoint_path(const fs::path& dir, std::uint64_t n) {
+    return dir / ("checkpoint-" + std::to_string(n) + ".snap");
+}
+
+inline fs::path meta_of(const fs::path& p) { return fs::path(p.string() + ".meta"); }
+
+/// Checkpoints in `dir` with cut below `below`, ascending; `complete` = with sidecar.
+inline std::vector<std::pair<std::uint64_t, fs::path>> list_checkpoints(const fs::path& dir, bool complete = true,
+                                                                        std::uint64_t below = UINT64_MAX) {
+    std::vector<std::pair<std::uint64_t, fs::path>> out;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return out;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        std::string name = e.path().filename().string();
+        if (name.size() < 17 || name.compare(0, 11, "checkpoint-") != 0 || name.compare(name.size() - 5, 5, ".snap") != 0)
+            continue;
+        std::uint64_t n = 0;
+        if (!parse_uint(std::string_view(name).substr(11, name.size() - 16), n) || n >= below) continue;
+        if (complete && !fs::exists(meta_of(e.path()))) continue;
+        out.push_back({n, e.path()});
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // ---- encodings ----------------------------------------------------------------------
@@ -102,7 +205,7 @@ inline std::uint64_t get_u64le(const std::uint8_t* d) { std::uint64_t v = 0; for
 inline std::array<std::uint8_t, HEADER> binary_header(Kind k, std::uint32_t p, std::uint32_t P, const BookConfig& b) {
     std::array<std::uint8_t, HEADER> h{};
     std::memcpy(h.data(), "ORDJ", 4);
-    put_u16(h.data() + 4, 1);
+    put_u16(h.data() + 4, VERSION);
     h[6] = std::uint8_t(k);
     h[7] = b.index == IndexKind::Tree ? 1 : 0;
     put_u32(h.data() + 8, p);
@@ -125,6 +228,14 @@ inline void write_cmd_line(std::uint64_t iseq, Symbol sym, const Command& c, std
 
 inline std::uint8_t tif_code(Tif t) { return std::uint8_t(t); }  // gtc 0, ioc 1, fok 2, post_only 3
 
+/// Seal a version-2 record: CRC-32C of the payload, then zeros.
+inline void seal(std::uint8_t* r, std::size_t payload) {
+    put_u32(r + payload, crc32c(r, payload));
+    put_u32(r + payload + 4, 0);
+}
+inline bool sealed(const std::uint8_t* r, std::size_t payload) { return get_u32le(r + payload) == crc32c(r, payload); }
+
+/// spec/JOURNAL.md §2.2 command record (version 2, sealed; CMD_RECORD bytes).
 inline void encode_cmd(std::uint64_t iseq, Symbol sym, const Command& c, std::uint8_t* r) {
     std::memset(r, 0, CMD_RECORD);
     put_u64(r, iseq);
@@ -146,6 +257,7 @@ inline void encode_cmd(std::uint64_t iseq, Symbol sym, const Command& c, std::ui
             put_u64(r + 32, c.qty);
             break;
     }
+    seal(r, CMD_RECORD_V1);
 }
 
 struct CmdRecord {
@@ -193,6 +305,7 @@ inline void encode_evt(std::uint64_t seq, Symbol sym, const Event& e, std::uint8
     put_u64(r + 24, b);
     put_u64(r + 32, std::uint64_t(c));
     put_u64(r + 40, d);
+    seal(r, EVT_RECORD_V1);
 }
 
 inline std::optional<std::pair<std::uint64_t, std::pair<Symbol, Event>>> decode_evt(const std::uint8_t* r) {
@@ -241,6 +354,7 @@ struct JournalHeader {
     Kind kind;
     std::uint32_t partition, partitions;
     BookConfig book;
+    std::uint16_t version = VERSION;  // binary journal version; JSONL reports 2
     bool operator==(const JournalHeader& o) const {
         return kind == o.kind && partition == o.partition && partitions == o.partitions &&
                flat::same_book(book, o.book);
@@ -281,18 +395,21 @@ inline JournalHeader parse_jsonl_header(const fs::path& p, std::string_view line
     if (!mo) corrupt(p, "bad max_orders");
     if (!ix || (*ix != "ladder" && *ix != "tree")) corrupt(p, "bad index");
     h.book = BookConfig{*pmin, *pmax, std::size_t(*mo), *ix == "tree" ? IndexKind::Tree : IndexKind::Ladder};
+    h.version = VERSION;
     return h;
 }
 
 inline JournalHeader parse_binary_header(const fs::path& p, const std::string& bytes) {
     if (bytes.size() < HEADER || bytes.compare(0, 4, "ORDJ") != 0) corrupt(p, "bad magic");
     auto d = reinterpret_cast<const std::uint8_t*>(bytes.data());
-    if (d[4] != 1 || d[5] != 0) corrupt(p, "unsupported version");
+    std::uint16_t version = std::uint16_t(d[4] | (d[5] << 8));
+    if (version != 1 && version != 2) corrupt(p, "unsupported version");
     JournalHeader h{};
+    h.version = version;
     if (d[6] == 1) h.kind = Kind::Cmd;
     else if (d[6] == 2) h.kind = Kind::Evt;
     else corrupt(p, "bad kind");
-    if (get_u32le(d + 16) != record_size(h.kind)) corrupt(p, "bad record_size");
+    if (get_u32le(d + 16) != record_size(h.kind, version)) corrupt(p, "bad record_size");
     if (d[7] > 1) corrupt(p, "bad index");
     h.partition = get_u32le(d + 8);
     h.partitions = get_u32le(d + 12);
@@ -307,115 +424,253 @@ inline JournalHeader read_header(const fs::path& p, JournalFormat f) {
     return parse_jsonl_header(p, std::string_view(bytes).substr(0, bytes.find('\n')));
 }
 
-/// Split text into lines; torn (no final newline) is corruption.
-inline std::vector<std::string_view> jsonl_lines(const fs::path& p, const std::string& text) {
-    if (!text.empty() && text.back() != '\n') corrupt(p, "torn tail (final line has no newline)");
-    std::vector<std::string_view> out;
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        auto e = text.find('\n', pos);
-        out.push_back(std::string_view(text).substr(pos, e - pos));
+/// Strict (default) or repair reading (spec/JOURNAL.md §5, §5.1).
+enum class ReadMode : std::uint8_t { Strict, Repair };
+
+/// One file's records as byte ranges (binary records already checksum-checked).
+struct Body {
+    JournalHeader header;
+    std::vector<std::pair<std::size_t, std::size_t>> records;  // offset, length
+    std::size_t valid_len = 0;                                 // bytes a repair keeps
+};
+
+inline Body split_body(const fs::path& p, const std::string& bytes, JournalFormat f, ReadMode mode) {
+    Body b;
+    if (f == JournalFormat::Binary) {
+        b.header = parse_binary_header(p, bytes);
+        std::size_t size = record_size(b.header.kind, b.header.version), body = bytes.size() - HEADER;
+        std::size_t n = body / size;
+        if (body % size && mode == ReadMode::Strict) corrupt(p, "torn tail (partial record)");
+        auto d = reinterpret_cast<const std::uint8_t*>(bytes.data());
+        if (b.header.version >= 2) {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!sealed(d + HEADER + i * size, payload_size(b.header.kind))) {
+                    if (mode == ReadMode::Repair && i + 1 == n) { --n; break; }  // a torn final record (§5.1)
+                    corrupt(p, "record " + std::to_string(i) + ": checksum mismatch");
+                }
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) b.records.push_back({HEADER + i * size, size});
+        b.valid_len = HEADER + n * size;
+        return b;
+    }
+    std::size_t end = bytes.size();
+    if (end && bytes[end - 1] != '\n') {
+        if (mode == ReadMode::Strict) corrupt(p, "torn tail (final line has no newline)");
+        auto nl = bytes.rfind('\n');
+        end = nl == std::string::npos ? 0 : nl + 1;
+    }
+    std::size_t first = std::min(bytes.find('\n'), end);
+    b.header = parse_jsonl_header(p, std::string_view(bytes).substr(0, first));
+    for (std::size_t pos = first + 1; pos < end;) {
+        auto e = bytes.find('\n', pos);
+        b.records.push_back({pos, e - pos});
         pos = e + 1;
     }
-    return out;
+    b.valid_len = end;
+    return b;
 }
 
-inline std::pair<JournalHeader, std::vector<CmdRecord>> read_cmd_journal(const fs::path& p, JournalFormat f) {
-    std::string bytes = read_file(p);
-    JournalHeader h{};
+inline std::vector<CmdRecord> decode_cmds(const fs::path& p, const std::string& bytes, JournalFormat f, const Body& b) {
     std::vector<CmdRecord> recs;
-    if (f == JournalFormat::Binary) {
-        h = parse_binary_header(p, bytes);
-        std::size_t body = bytes.size() - HEADER;
-        if (body % CMD_RECORD) corrupt(p, "torn tail (partial record)");
-        auto d = reinterpret_cast<const std::uint8_t*>(bytes.data()) + HEADER;
-        for (std::size_t i = 0; i < body / CMD_RECORD; ++i) {
-            auto r = decode_cmd(d + i * CMD_RECORD);
+    recs.reserve(b.records.size());
+    for (std::size_t i = 0; i < b.records.size(); ++i) {
+        auto [off, len] = b.records[i];
+        if (f == JournalFormat::Binary) {
+            auto r = decode_cmd(reinterpret_cast<const std::uint8_t*>(bytes.data()) + off);
             if (!r) corrupt(p, "record " + std::to_string(i) + ": bad codes");
             recs.push_back(*r);
-        }
-    } else {
-        auto lines = jsonl_lines(p, bytes);
-        h = parse_jsonl_header(p, lines.empty() ? std::string_view() : lines[0]);
-        for (std::size_t i = 1; i < lines.size(); ++i) {
-            auto l = lines[i];
+        } else {
+            std::string_view l(bytes.data() + off, len);
             auto iseq = flat::get_u64(l, "iseq");
             auto sym = flat::get_u64(l, "symbol");
             auto cmd = flat::parse_command(l);
             if (!iseq || !sym || *sym > UINT32_MAX || !cmd)
-                corrupt(p, "line " + std::to_string(i + 1) + ": malformed record: " + std::string(l));
+                corrupt(p, "line " + std::to_string(i + 2) + ": malformed record: " + std::string(l));
             recs.push_back({*iseq, Symbol(*sym), *cmd});
         }
     }
-    if (h.kind != Kind::Cmd) corrupt(p, "not a command journal");
-    for (std::size_t i = 1; i < recs.size(); ++i)
-        if (recs[i].iseq <= recs[i - 1].iseq)
-            corrupt(p, "iseq not increasing (" + std::to_string(recs[i - 1].iseq) + " then " +
-                           std::to_string(recs[i].iseq) + ")");
-    return {h, recs};
+    return recs;
 }
 
-/// Every partition's command journal in `dir` (count from cmd-0's header).
-inline std::pair<JournalHeader, std::vector<std::vector<CmdRecord>>> read_cmd_dir(const fs::path& dir, JournalFormat f) {
-    auto first = journal_path(dir, Kind::Cmd, 0, f);
-    auto [h0, r0] = read_cmd_journal(first, f);
-    if (h0.partition != 0) corrupt(first, "header partition is not 0");
-    std::vector<std::vector<CmdRecord>> all;
-    all.push_back(std::move(r0));
-    for (std::uint32_t p = 1; p < h0.partitions; ++p) {
-        auto path = journal_path(dir, Kind::Cmd, p, f);
-        auto [h, r] = read_cmd_journal(path, f);
-        if (h.partition != p || h.partitions != h0.partitions || !flat::same_book(h.book, h0.book))
-            corrupt(path, "header does not match its file name, partition count or book config");
-        all.push_back(std::move(r));
+inline void check_increasing(const fs::path& p, const std::vector<CmdRecord>& recs, std::optional<std::uint64_t> after) {
+    for (auto& r : recs) {
+        if (after && r.iseq <= *after)
+            corrupt(p, "iseq not increasing (" + std::to_string(*after) + " then " + std::to_string(r.iseq) + ")");
+        after = r.iseq;
     }
+}
+
+/// One command journal file, strictly (torn tails, bad records and
+/// checksums, non-increasing iseq are corruption).
+inline std::pair<JournalHeader, std::vector<CmdRecord>> read_cmd_journal(const fs::path& p, JournalFormat f) {
+    std::string bytes = read_file(p);
+    Body b = split_body(p, bytes, f, ReadMode::Strict);
+    if (b.header.kind != Kind::Cmd) corrupt(p, "not a command journal");
+    auto recs = decode_cmds(p, bytes, f, b);
+    check_increasing(p, recs, std::nullopt);
+    return {b.header, std::move(recs)};
+}
+
+/// Every partition's command journal in `dir`, all segments in order
+/// (spec/JOURNAL.md §1, §5 step 3).
+inline std::pair<JournalHeader, std::vector<std::vector<CmdRecord>>> read_cmd_dir(const fs::path& dir, JournalFormat f) {
+    auto segs = list_segments(dir, Kind::Cmd, f);
+    if (segs.empty()) corrupt(journal_path(dir, Kind::Cmd, 0, f), "no command journal");
+    JournalHeader h0 = read_header(segs[0].path, f);
+    std::vector<std::vector<CmdRecord>> all(h0.partitions);
+    std::vector<bool> seen(h0.partitions, false);
+    for (auto& s : segs) {
+        auto [h, recs] = read_cmd_journal(s.path, f);
+        if (h.partition != s.partition || s.partition >= h0.partitions || h.partitions != h0.partitions ||
+            !flat::same_book(h.book, h0.book))
+            corrupt(s.path, "header does not match its file name, partition count or book config");
+        auto& part = all[s.partition];
+        check_increasing(s.path, recs,
+                         part.empty() ? std::nullopt : std::optional<std::uint64_t>(part.back().iseq));
+        part.insert(part.end(), recs.begin(), recs.end());
+        seen[s.partition] = true;
+    }
+    for (std::uint32_t p = 0; p < h0.partitions; ++p)
+        if (!seen[p]) corrupt(journal_path(dir, Kind::Cmd, p, f), "partition has no journal");
     return {h0, std::move(all)};
 }
 
-/// An event journal as canonical symbol-tagged lines.
+/// An event journal file as canonical symbol-tagged lines.
 inline std::vector<std::string> read_evt_journal(const fs::path& p, JournalFormat f) {
     std::string bytes = read_file(p);
+    Body b = split_body(p, bytes, f, ReadMode::Strict);
     std::vector<std::string> out;
-    if (f == JournalFormat::Binary) {
-        parse_binary_header(p, bytes);
-        std::size_t body = bytes.size() - HEADER;
-        if (body % EVT_RECORD) corrupt(p, "torn tail (partial record)");
-        auto d = reinterpret_cast<const std::uint8_t*>(bytes.data()) + HEADER;
-        for (std::size_t i = 0; i < body / EVT_RECORD; ++i) {
-            auto r = decode_evt(d + i * EVT_RECORD);
+    for (std::size_t i = 0; i < b.records.size(); ++i) {
+        auto [off, len] = b.records[i];
+        if (f == JournalFormat::Binary) {
+            auto r = decode_evt(reinterpret_cast<const std::uint8_t*>(bytes.data()) + off);
             if (!r) corrupt(p, "record " + std::to_string(i) + ": bad codes");
             std::string l;
             write_canonical_sym(r->first, r->second.first, r->second.second, l);
             out.push_back(std::move(l));
+        } else {
+            out.emplace_back(bytes.data() + off, len);
         }
-    } else {
-        auto lines = jsonl_lines(p, bytes);
-        parse_jsonl_header(p, lines.empty() ? std::string_view() : lines[0]);
-        for (std::size_t i = 1; i < lines.size(); ++i) out.emplace_back(lines[i]);
+    }
+    return out;
+}
+
+/// A partition's whole event journal (all segments, in order).
+inline std::vector<std::string> read_evt_partition(const fs::path& dir, JournalFormat f, std::uint32_t p) {
+    std::vector<std::string> out;
+    for (auto& s : list_segments(dir, Kind::Evt, f))
+        if (s.partition == p) {
+            auto l = read_evt_journal(s.path, f);
+            out.insert(out.end(), l.begin(), l.end());
+        }
+    return out;
+}
+
+/// spec/JOURNAL.md §5.1: truncate a torn tail off each journal family's last
+/// segment, in place. Returns (file, bytes removed) per truncation.
+inline std::vector<std::pair<fs::path, std::uint64_t>> repair_dir(const fs::path& dir, JournalFormat f) {
+    std::vector<std::pair<fs::path, std::uint64_t>> out;
+    for (Kind k : {Kind::Cmd, Kind::Evt}) {
+        std::map<std::uint32_t, fs::path> last;
+        for (auto& s : list_segments(dir, k, f)) last[s.partition] = s.path;
+        for (auto& [p, path] : last) {
+            std::string bytes = read_file(path);
+            Body b = split_body(path, bytes, f, ReadMode::Repair);
+            if (b.valid_len < bytes.size()) {
+                std::error_code ec;
+                fs::resize_file(path, b.valid_len, ec);
+                if (ec) corrupt(path, ec.message());
+                int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+                if (fd >= 0) { ::fsync(fd); ::close(fd); }
+                out.push_back({path, bytes.size() - b.valid_len});
+            }
+        }
     }
     return out;
 }
 
 // ---- writing -------------------------------------------------------------------------------
 
-/// Create (header written) or open for append (header checked); fd at end.
-inline int open_journal(const JournalConfig& cfg, Kind k, std::uint32_t p, std::uint32_t P, const BookConfig& book) {
-    auto path = journal_path(cfg.dir, k, p, cfg.format);
-    if (cfg.append && fs::exists(path)) {
-        JournalHeader want{k, p, P, book};
-        if (!(read_header(path, cfg.format) == want)) corrupt(path, "header does not match the pipeline");
-        int fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
-        if (fd < 0) throw std::runtime_error(path.string() + ": " + std::strerror(errno));
-        return fd;
-    }
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+inline int open_fd(const fs::path& path, int flags) {
+    int fd = ::open(path.c_str(), flags | O_CLOEXEC, 0644);
     if (fd < 0) throw std::runtime_error(path.string() + ": " + std::strerror(errno));
+    return fd;
+}
+
+/// Create segment `start` (truncating any old file) with its header; fd at end.
+inline int open_segment(const fs::path& dir, JournalFormat f, Kind k, std::uint32_t p, std::uint32_t P,
+                        const BookConfig& book, std::uint64_t start) {
+    auto path = segment_path(dir, k, p, start, f);
+    int fd = open_fd(path, O_WRONLY | O_CREAT | O_TRUNC);
     std::string h;
-    if (cfg.format == JournalFormat::Jsonl) h = jsonl_header(k, p, P, book);
+    if (f == JournalFormat::Jsonl) h = jsonl_header(k, p, P, book);
     else { auto b = binary_header(k, p, P, book); h.assign(reinterpret_cast<const char*>(b.data()), b.size()); }
     if (::write(fd, h.data(), h.size()) != ssize_t(h.size()))
         throw std::runtime_error(path.string() + ": header write failed");
     return fd;
+}
+
+/// Append mode: the partition's last segment (header checked); otherwise a
+/// fresh segment 0 (callers clear the directory once first).
+inline int open_journal(const JournalConfig& cfg, Kind k, std::uint32_t p, std::uint32_t P, const BookConfig& book) {
+    if (cfg.append) {
+        std::optional<fs::path> last;
+        for (auto& s : list_segments(cfg.dir, k, cfg.format))
+            if (s.partition == p) last = s.path;
+        if (last) {
+            JournalHeader want{k, p, P, book};
+            JournalHeader h = read_header(*last, cfg.format);
+            if (!(h == want)) corrupt(*last, "header does not match the pipeline");
+            if (cfg.format == JournalFormat::Binary && h.version != VERSION)
+                corrupt(*last, "cannot append to a version-1 journal");
+            return open_fd(*last, O_WRONLY | O_APPEND);
+        }
+    }
+    return open_segment(cfg.dir, cfg.format, k, p, P, book, 0);
+}
+
+/// Remove checkpoints with cut below `n` (body first, so a half-removed pair
+/// is never a complete checkpoint).
+inline void remove_checkpoints_below(const fs::path& dir, std::uint64_t n) {
+    for (auto& [cut, path] : list_checkpoints(dir, false, n)) {
+        fs::remove(path);
+        fs::remove(meta_of(path));
+    }
+}
+
+/// spec/JOURNAL.md §6 step 4: remove segments that start below `n`.
+inline void remove_segments_below(const fs::path& dir, JournalFormat f, std::uint64_t n) {
+    for (Kind k : {Kind::Cmd, Kind::Evt})
+        for (auto& s : list_segments(dir, k, f))
+            if (s.start < n) fs::remove(s.path);
+}
+
+/// A fresh (non-append) pipeline owns its directory's journals.
+inline void clear_journal_dir(const fs::path& dir, JournalFormat f) {
+    remove_segments_below(dir, f, UINT64_MAX);
+    remove_checkpoints_below(dir, UINT64_MAX);
+}
+
+/// Write `contents` durably: temporary name, sync, rename, sync the directory.
+inline void write_durably(const fs::path& path, const std::string& contents) {
+    fs::path tmp(path.string() + ".tmp");
+    int fd = open_fd(tmp, O_WRONLY | O_CREAT | O_TRUNC);
+    std::size_t off = 0;
+    while (off < contents.size()) {
+        ssize_t n = ::write(fd, contents.data() + off, contents.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ::close(fd);
+            throw std::runtime_error(tmp.string() + ": " + std::strerror(errno));
+        }
+        off += std::size_t(n);
+    }
+    if (::fsync(fd) != 0) { ::close(fd); throw std::runtime_error(tmp.string() + ": fsync failed"); }
+    ::close(fd);
+    fs::rename(tmp, path);
+    int dfd = ::open(path.parent_path().empty() ? "." : path.parent_path().c_str(), O_RDONLY | O_CLOEXEC);
+    if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
 }
 
 /// The platform's real durability primitive.
@@ -463,16 +718,24 @@ class ChunkWriter {
     /// chunk is in flight — backpressure).
     void hand_off() {
         if (chunks_[cur_].empty()) return;
-        to_io_.push(Msg{cur_, last_, records_, false});
+        to_io_.push(Msg{cur_, last_, records_, false, -1});
         records_ = 0;
         cur_ = free_.pop();
+    }
+
+    /// Continue in `next_fd` (a new segment, header written): everything so
+    /// far goes to the current file, which the I/O thread syncs (per policy)
+    /// and closes (spec/JOURNAL.md §6 step 2).
+    void rotate(int next_fd) {
+        hand_off();
+        to_io_.push(Msg{0, 0, 0, false, next_fd});
     }
 
     /// Write and (per policy) sync everything; returns the first I/O error.
     std::optional<std::string> finish() {
         if (io_.joinable()) {
             hand_off();
-            to_io_.push(Msg{0, 0, 0, true});
+            to_io_.push(Msg{0, 0, 0, true, -1});
             io_.join();
             ::close(fd_);
         }
@@ -484,6 +747,7 @@ class ChunkWriter {
         std::size_t chunk;
         std::uint64_t last, records;
         bool stop;
+        int rotate_fd;  // >= 0: switch to this file
     };
     /// Fixed-capacity blocking queue (no allocation after construction).
     template <class T>
@@ -561,6 +825,14 @@ class ChunkWriter {
             bool stop = false;
             for (;;) {  // write everything queued, then decide on one fsync
                 if (m.stop) { stop = true; break; }
+                if (m.rotate_fd >= 0) {
+                    if (unsynced > 0 && fsync_ && fsync_->mode != FsyncPolicy::Mode::Never) sync(written);
+                    unsynced = 0;
+                    ::close(fd_);
+                    fd_ = m.rotate_fd;
+                    if (!to_io_.try_pop(m)) break;
+                    continue;
+                }
                 write_all(chunks_[m.chunk]);
                 written = m.last;
                 marks_.flushed->store(written, std::memory_order_release);

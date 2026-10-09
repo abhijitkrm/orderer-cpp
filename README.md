@@ -5,7 +5,7 @@
 The C++20 implementation of [orderer](https://github.com/abhijitkrm/orderer):
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book. It is
-header-only, has no dependencies, and implements `orderer-spec/1.1`. It is
+header-only, has no dependencies, and implements `orderer-spec/1.2`. It is
 a port of [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -50,7 +50,8 @@ The full version is `examples/quickstart.cpp` (CMake target `quickstart`).
 | Routing | `PartitionMap` | hash (spec/ROUTING.md) + table overrides |
 | Journals | `JournalConfig`, `FsyncPolicy` | JSONL or binary, group-commit fsync on I/O threads |
 | Waiting | `Waits` / `disruptor::WaitStrategy` | BusySpin, Yield, Backoff, Blocking |
-| Recovery | `recover<C>(…)`, `read_snapshot`, `restore<C>` | snapshot + journals → cores at any P |
+| Recovery | `recover<C>(…)`, `read_snapshot`, `restore<C>`, `repair_dir` | snapshot + journals → cores at any P; torn tails repaired |
+| Checkpoints | `Pipeline::checkpoint()` | durable snapshot + journal segment rotation; old segments removed |
 
 ## Build, test, harness
 
@@ -70,7 +71,9 @@ The suites:
 - `pipeline`: partitions, recovery, controls, durability, backpressure,
   plugs.
 - `no_alloc`: zero steady-state allocations.
-- `vectors`: orderer vectors through the binaries, byte-exact.
+- `conformance`: the vendored `spec/conformance.sh`, every orderer vector
+  through the binaries, byte-exact (checkpoints, repair and version-1
+  journals included).
 
 Cross-implementation proofs (diffuzz, exhaustive, e2e, snapdiff) run from
 the spec repo with this repo checked out next to it.

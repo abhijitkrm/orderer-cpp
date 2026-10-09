@@ -112,6 +112,7 @@ struct Shared {
     std::condition_variable snaps_cv;
     std::map<std::uint64_t, SnapState> snaps;
     std::vector<std::shared_ptr<std::atomic<std::uint64_t>>> flushed, durable;
+    std::optional<JournalConfig> journal;
     std::mutex alerts_m;  // threads may fail while later rings are still registering
     std::vector<std::function<void()>> alerts;
 
@@ -287,6 +288,7 @@ class Pipeline {
     Status publish(Symbol s, const Command& c) { return handle_->publish(s, c); }
     Status try_publish(Symbol s, const Command& c) { return handle_->try_publish(s, c); }
     Status publish_batch(const std::vector<std::pair<Symbol, Command>>& v) { return handle_->publish_batch(v); }
+    Status publish_batch(const std::pair<Symbol, Command>* cmds, std::size_t n) { return handle_->publish_batch(cmds, n); }
     std::uint32_t partitions() const { return sh_->partitions; }
     std::uint32_t partition_of(Symbol s) const { return map_.partition(s); }
     BookConfig book_config() const { return sh_->book; }
@@ -306,13 +308,36 @@ class Pipeline {
     }
 
     /// A consistent snapshot of every book, cut at this point of the ingress order.
-    Snapshot snapshot() {
+    Snapshot snapshot() { return snapshot_op(Control::Snapshot); }
+
+    /// A checkpoint (spec/JOURNAL.md §6): a snapshot cut here; every journal
+    /// rotates onto a new segment at the cut; the snapshot is written durably
+    /// into the journal directory; older segments and checkpoints go.
+    Snapshot checkpoint() {
+        if (!sh_->journal) throw Error(Error::Kind::Config, "checkpoint needs journals");
+        const auto& cfg = *sh_->journal;
+        Snapshot s = snapshot_op(Control::Checkpoint);
+        drain();  // every egress has rotated its event journal
+        try {
+            auto path = checkpoint_path(cfg.dir, s.iseq);
+            write_durably(path, s.body);
+            write_durably(meta_of(path), s.meta());
+            remove_segments_below(cfg.dir, cfg.format, s.iseq);
+            remove_checkpoints_below(cfg.dir, s.iseq);
+        } catch (const std::exception& e) {
+            throw Error(Error::Kind::Io, e.what());
+        }
+        return s;
+    }
+
+  private:
+    Snapshot snapshot_op(Control ctl) {
         std::uint64_t op = sh_->next_op.fetch_add(1) + 1;
         {
             std::lock_guard<std::mutex> g(sh_->snaps_m);
             sh_->snaps[op].remaining = sh_->partitions;
         }
-        publish_ctl(Control::Snapshot, op);
+        publish_ctl(ctl, op);
         std::unique_lock<std::mutex> g(sh_->snaps_m);
         for (;;) {
             if (sh_->failed.load()) { g.unlock(); sh_->check(); }
@@ -330,6 +355,8 @@ class Pipeline {
         s.partitions = sh_->partitions;
         return s;
     }
+
+  public:
 
     /// Stop accepting commands, drain everything sequenced, stop every
     /// thread. Idempotent. Throws Error(Failed) if any thread failed.
@@ -373,6 +400,18 @@ class Pipeline {
         if (r != disruptor::Publish::Ok) throw Error(Error::Kind::Closed, "pipeline closed");
     }
 
+    /// Opens a partition's next journal segment (spec/JOURNAL.md §6 step 2).
+    struct Segmenter {
+        fs::path dir;
+        JournalFormat format{};
+        Kind kind{};
+        std::uint32_t p = 0, partitions = 1;
+        BookConfig book{};
+        void rotate(ChunkWriter& w, std::uint64_t cut) const {
+            w.rotate(open_segment(dir, format, kind, p, partitions, book, cut));
+        }
+    };
+
     struct EgressPart {
         std::uint32_t p;
         disruptor::Consumer<EvtMsg> outbox;
@@ -386,6 +425,8 @@ class Pipeline {
     struct EvtJournal final : Egress {
         std::unique_ptr<ChunkWriter> w;
         JournalFormat f;
+        Segmenter seg;
+        void on_checkpoint(std::uint64_t cut) override { seg.rotate(*w, cut); }
         std::chrono::steady_clock::time_point last_handoff = std::chrono::steady_clock::now();
         void on_event(const EvtMsg& m) override {
             w->reserve(MAX_RECORD);
@@ -429,6 +470,7 @@ class Pipeline {
         sh_->book = b.book_;
         sh_->timestamps = b.timestamps_;
         sh_->egress_epoch.reset(new detail::Padded[P]);
+        sh_->journal = b.journal_;
         for (std::uint32_t p = 0; p < P; ++p) {
             sh_->flushed.push_back(std::make_shared<std::atomic<std::uint64_t>>(start_wm));
             sh_->durable.push_back(std::make_shared<std::atomic<std::uint64_t>>(journaled ? start_wm : UINT64_MAX));
@@ -440,6 +482,7 @@ class Pipeline {
             const auto& jc = *b.journal_;
             try {
                 fs::create_directories(jc.dir);
+                if (!jc.append) clear_journal_dir(jc.dir, jc.format);
                 for (std::uint32_t p = 0; p < P; ++p) {
                     cmd_w[p] = std::make_unique<ChunkWriter>(open_journal(jc, Kind::Cmd, p, P, b.book_), jc.fsync,
                                                              Marks{sh_->flushed[p], sh_->durable[p]});
@@ -473,8 +516,10 @@ class Pipeline {
 
             std::optional<JournalFormat> fmt;
             if (journaled) fmt = b.journal_->format;
+            std::optional<Segmenter> seg;
+            if (journaled) seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Cmd, p, P, b.book_};
             threads_.emplace_back(engine_thread, sh_, std::move(inbox_cons[0]), std::move(outbox),
-                                  std::move(cores[p]), std::move(cmd_w[p]), fmt);
+                                  std::move(cores[p]), std::move(cmd_w[p]), fmt, seg);
 
             EgressCtx ctx{p, P, sh_->epoch, sh_->durable[p]};
             EgressPart part{p, std::move(outbox_cons[0]), {}, ctx};
@@ -482,6 +527,7 @@ class Pipeline {
                 auto ej = std::make_unique<EvtJournal>();
                 ej->w = std::move(evt_w[p]);
                 ej->f = b.journal_->format;
+                ej->seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Evt, p, P, b.book_};
                 part.plugs.push_back(std::move(ej));
             }
             for (auto& f : factories) part.plugs.push_back(f(ctx));
@@ -536,7 +582,7 @@ class Pipeline {
 
     static void engine_thread(std::shared_ptr<detail::Shared> sh, disruptor::Consumer<CmdMsg> inbox,
                               disruptor::SingleProducer<EvtMsg> out, C core, std::unique_ptr<ChunkWriter> journal,
-                              std::optional<JournalFormat> fmt) {
+                              std::optional<JournalFormat> fmt, std::optional<Segmenter> seg) {
         guarded(*sh, "engine", [&] {
             auto last_handoff = std::chrono::steady_clock::now();
             bool stop = false;
@@ -557,7 +603,9 @@ class Pipeline {
                             });
                         });
                     } else {
-                        if (m.ctl == Control::Snapshot) {
+                        // the new segment starts at this cut, before the snapshot is reported
+                        if (m.ctl == Control::Checkpoint && journal && seg) seg->rotate(*journal, m.iseq);
+                        if (m.ctl == Control::Snapshot || m.ctl == Control::Checkpoint) {
                             std::vector<Block> blocks;
                             core.snapshot_blocks(blocks);
                             {
@@ -619,6 +667,8 @@ class Pipeline {
                             sh->egress_epoch[ep.p].v.store(m.arg, std::memory_order_release);
                         } else if (m.ctl == Control::Shutdown) {
                             stop = true;
+                        } else if (m.ctl == Control::Checkpoint) {
+                            for (auto& pl : ep.plugs) pl->on_checkpoint(m.iseq);
                         }
                         if (eob)
                             for (auto& pl : ep.plugs) pl->on_batch_end();

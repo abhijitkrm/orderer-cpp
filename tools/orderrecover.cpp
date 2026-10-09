@@ -1,9 +1,11 @@
 // orderrecover — spec/HARNESS.md §4.3 (mirrors matcherrecover).
 //   orderrecover <snapshot> <tail-file> [--partitions P] [--partition-map F]
-//   orderrecover --journal-dir DIR [--snap PATH] [--binary] [--partitions P] [--partition-map F]
+//   orderrecover --journal-dir DIR [--snap PATH] [--binary] [--repair] [--partitions P] [--partition-map F]
 // Tail form: restore, submit every tail line without "format" through a
 // pipeline, print the replayed events. Journal form: recover from journals
-// (after the optional snapshot's cut). Malformed/corrupt input exits 2.
+// (after the optional snapshot's cut; by default the directory's newest
+// checkpoint). Malformed/corrupt input exits 2; --repair first truncates
+// torn tails (spec/JOURNAL.md §5.1).
 #include <orderer/harness.hpp>
 
 using namespace orderer;
@@ -52,11 +54,15 @@ static void tail_form(const std::string& snap_path, const std::string& tail_path
 }
 
 static void journal_form(const std::string& dir, const std::optional<std::string>& snap_path, JournalFormat fmt,
-                         const PartitionMap& map) {
+                         bool repair, const PartitionMap& map) {
     std::vector<std::string> parts(map.partitions());
     try {
+        if (repair)
+            for (auto& [path, bytes] : repair_dir(dir, fmt))
+                std::fprintf(stderr, "repaired %s %llu\n", path.c_str(), (unsigned long long)bytes);
         std::optional<Snapshot> snap;
         if (snap_path) snap = read_snapshot(*snap_path);
+        else if (auto cps = list_checkpoints(dir); !cps.empty()) snap = read_snapshot(cps.back().second);
         recover<FifoCore>(BookConfig{}, map, snap ? &*snap : nullptr,
                           std::make_optional(std::make_pair(fs::path(dir), fmt)),
                           [&](std::uint32_t p, Symbol s, std::uint64_t seq, const Event& ev) {
@@ -74,12 +80,13 @@ static void journal_form(const std::string& dir, const std::optional<std::string
 int main(int argc, char** argv) {
     const std::string usage =
         "orderrecover <snapshot> <tail-file> [--partitions P] [--partition-map F]\n"
-        "       orderrecover --journal-dir DIR [--snap PATH] [--binary] [--partitions P] [--partition-map F]";
-    Args a(argc, argv, usage, {"--partitions", "--partition-map", "--journal-dir", "--snap"}, {"--binary"});
+        "       orderrecover --journal-dir DIR [--snap PATH] [--binary] [--repair] [--partitions P] [--partition-map F]";
+    Args a(argc, argv, usage, {"--partitions", "--partition-map", "--journal-dir", "--snap"}, {"--binary", "--repair"});
     PartitionMap map = partition_map(a);
     if (auto dir = a.get("--journal-dir"); dir && a.positional.empty()) {
-        journal_form(*dir, a.get("--snap"), a.flag("--binary") ? JournalFormat::Binary : JournalFormat::Jsonl, map);
-    } else if (!dir && a.positional.size() == 2 && !a.get("--snap") && !a.flag("--binary")) {
+        journal_form(*dir, a.get("--snap"), a.flag("--binary") ? JournalFormat::Binary : JournalFormat::Jsonl,
+                     a.flag("--repair"), map);
+    } else if (!dir && a.positional.size() == 2 && !a.get("--snap") && !a.flag("--binary") && !a.flag("--repair")) {
         tail_form(a.positional[0], a.positional[1], map);
     } else {
         die(usage);

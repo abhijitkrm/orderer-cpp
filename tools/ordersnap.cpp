@@ -13,5 +13,7 @@ int main(int argc, char** argv) {
     if (a.positional.size() != 1) die(usage);
     Corpus c = load_corpus(a.positional[0]);
     Common com = common(a);
-    print(run_corpus(c, com, true, true).second->body);
+    RunOpts opts;
+    opts.snapshot = true;
+    print(run_corpus(c, com, true, opts).second->body);
 }

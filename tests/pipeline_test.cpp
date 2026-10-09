@@ -199,8 +199,10 @@ TEST(torn_and_corrupt_journals_are_errors) {
         expect_corrupt(good.substr(0, good.size() - 7), "torn");
         std::string back = good;
         if (fmt == JournalFormat::Binary) {
+            // a well-formed (resealed) record, just out of order
             auto off = back.size() - CMD_RECORD;
             for (int i = 0; i < 8; ++i) back[off + std::size_t(i)] = i == 0 ? 1 : 0;
+            seal(reinterpret_cast<std::uint8_t*>(&back[off]), CMD_RECORD_V1);
         } else {
             back += "{\"cmd\":\"cancel\",\"symbol\":0,\"order_id\":1,\"iseq\":3}\n";
         }
@@ -363,6 +365,142 @@ TEST(failing_core_fails_the_pipeline_instead_of_hanging) {
     failed = false;
     try { p->shutdown(); } catch (const Error& e) { failed = e.kind == Error::Kind::Failed; }
     CHECK(failed);
+}
+
+// ---- 1.2: checksums, repair, checkpoints --------------------------------------------------
+
+TEST(crc32c_matches_the_spec_check_value) {
+    const char* v = "123456789";
+    CHECK(crc32c(reinterpret_cast<const std::uint8_t*>(v), 9) == 0xE3069283u);
+}
+
+TEST(checksums_catch_flipped_bits_anywhere) {
+    auto dir = scratch(SCRATCH, "crc");
+    auto p = Pipeline<FifoCore>::builder().book_config(fuzz_cfg()).journal(jcfg(dir, JournalFormat::Binary)).build();
+    p->publish_batch(fuzz_corpus(9, 300, 2));
+    p->shutdown();
+    auto path = journal_path(dir, Kind::Cmd, 0, JournalFormat::Binary);
+    std::string bad = slurp(path);
+    bad[HEADER + 100 * CMD_RECORD + 20] ^= 0x10;
+    std::ofstream(path, std::ios::binary) << bad;
+    bool threw = false;
+    try { read_cmd_dir(dir, JournalFormat::Binary); } catch (const CorruptJournal& e) {
+        threw = std::string(e.what()).find("checksum") != std::string::npos;
+    }
+    CHECK(threw) << "strict";
+    threw = false;
+    try { repair_dir(dir, JournalFormat::Binary); } catch (const CorruptJournal&) { threw = true; }
+    CHECK(threw) << "mid-file damage is not repairable";
+}
+
+TEST(repair_cuts_only_a_torn_tail) {
+    auto cmds = fuzz_corpus(10, 400, 3);
+    for (auto fmt : {JournalFormat::Jsonl, JournalFormat::Binary}) {
+        auto dir = scratch(SCRATCH, "repair-" + std::to_string(int(fmt)));
+        auto p = Pipeline<FifoCore>::builder().book_config(fuzz_cfg()).journal(jcfg(dir, fmt)).build();
+        p->publish_batch(cmds);
+        p->shutdown();
+        auto path = journal_path(dir, Kind::Cmd, 0, fmt);
+        std::string good = slurp(path);
+        auto full = read_cmd_dir(dir, fmt).second[0];
+        std::ofstream(path, std::ios::binary) << good.substr(0, good.size() - 5);
+        bool threw = false;
+        try { read_cmd_dir(dir, fmt); } catch (const CorruptJournal&) { threw = true; }
+        CHECK(threw) << "strict rejects a torn tail";
+        CHECK(repair_dir(dir, fmt).size() == 1);
+        auto got = read_cmd_dir(dir, fmt).second[0];
+        CHECK(got.size() == full.size() - 1 && got.back().iseq == full[full.size() - 2].iseq) << "a prefix survives";
+        if (fmt == JournalFormat::Binary) {
+            std::string zeroed = good;
+            std::fill(zeroed.end() - CMD_RECORD, zeroed.end(), '\0');
+            std::ofstream(path, std::ios::binary) << zeroed;
+            CHECK(repair_dir(dir, fmt).size() == 1) << "a complete record that never reached the disk";
+            CHECK(read_cmd_dir(dir, fmt).second[0].size() == full.size() - 1);
+        }
+        CHECK(repair_dir(dir, fmt).empty()) << "a clean file is left alone";
+    }
+}
+
+TEST(checkpoints_rotate_segments_and_bound_recovery) {
+    auto cfg = fuzz_cfg();
+    auto cmds = fuzz_corpus(12, 3000, 6);
+    for (auto fmt : {JournalFormat::Jsonl, JournalFormat::Binary}) {
+        auto dir = scratch(SCRATCH, "ckpt-" + std::to_string(int(fmt)));
+        auto [f, h] = collect(true);
+        auto p = Pipeline<FifoCore>::builder().book_config(cfg).partitions(3).journal(jcfg(dir, fmt)).egress(f).build();
+        Cmds a(cmds.begin(), cmds.begin() + 1000), b(cmds.begin() + 1000, cmds.begin() + 2200),
+            c(cmds.begin() + 2200, cmds.end());
+        p->publish_batch(a);
+        auto c1 = p->checkpoint();
+        p->publish_batch(b);
+        auto c2 = p->checkpoint();
+        p->publish_batch(c);
+        p->shutdown();
+        CHECK(c1.iseq == 1000 && c2.iseq == 2200);
+        auto cps = list_checkpoints(dir);
+        CHECK(cps.size() == 1 && cps[0].first == 2200) << "only the last checkpoint remains";
+        for (Kind k : {Kind::Cmd, Kind::Evt}) {
+            auto segs = list_segments(dir, k, fmt);
+            CHECK(segs.size() == 3);
+            for (auto& s : segs) CHECK(s.start == 2200) << s.path;
+        }
+        CHECK(c2.body == reference_snapshot(cfg, cmds, 2200));
+        auto snap = read_snapshot(cps[0].second);
+        PartitionMap m;
+        PartitionMap::make(3, {}, m);
+        std::vector<std::string> replayed;
+        auto rec = recover<FifoCore>(cfg, m, &snap, std::make_optional(std::make_pair(dir, fmt)),
+                                     [&](std::uint32_t, Symbol s, std::uint64_t q, const Event& e) {
+                                         std::string l;
+                                         write_canonical_sym(q, s, e, l);
+                                         replayed.push_back(l);
+                                     });
+        auto all = reference_lines(cfg, cmds);
+        auto prefix = reference_lines(cfg, Cmds(cmds.begin(), cmds.begin() + 2200)).size();
+        CHECK(rec.replayed == cmds.size() - 2200);
+        CHECK(std::vector<std::string>(all.begin() + std::ptrdiff_t(prefix), all.end()) == replayed);
+        std::vector<std::string> evts;
+        for (std::uint32_t q = 0; q < 3; ++q) {
+            auto e = read_evt_partition(dir, fmt, q);
+            evts.insert(evts.end(), e.begin(), e.end());
+        }
+        std::vector<std::string> want(all.begin() + std::ptrdiff_t(prefix), all.end());
+        std::sort(evts.begin(), evts.end());
+        std::sort(want.begin(), want.end());
+        CHECK(evts == want) << "event segments hold the tail";
+        CHECK(lines(h->listing()).size() == all.size());
+    }
+}
+
+TEST(append_continues_the_last_segment_after_a_checkpoint) {
+    auto cfg = fuzz_cfg();
+    auto cmds = fuzz_corpus(14, 2000, 4);
+    auto dir = scratch(SCRATCH, "ckpt-append");
+    auto j = jcfg(dir, JournalFormat::Binary);
+    {
+        auto p = Pipeline<FifoCore>::builder().book_config(cfg).partitions(2).journal(j).build();
+        p->publish_batch(Cmds(cmds.begin(), cmds.begin() + 800));
+        p->checkpoint();
+        p->publish_batch(Cmds(cmds.begin() + 800, cmds.begin() + 1200));
+        p->shutdown();
+    }
+    PartitionMap m;
+    PartitionMap::make(2, {}, m);
+    auto snap = read_snapshot(list_checkpoints(dir)[0].second);
+    auto rec = recover<FifoCore>(cfg, m, &snap, std::make_optional(std::make_pair(dir, JournalFormat::Binary)),
+                                 [](auto, auto, auto, auto&) {});
+    CHECK(rec.last_iseq == 1200);
+    j.append = true;
+    auto book = rec.book;
+    auto p = Pipeline<FifoCore>::builder().book_config(book).partition_map(m).journal(j)
+                 .initial(std::move(rec).into_initial()).build();
+    p->publish_batch(Cmds(cmds.begin() + 1200, cmds.end()));
+    auto s = p->snapshot();
+    p->shutdown();
+    CHECK(s.iseq == 2000 && s.body == reference_snapshot(cfg, cmds, cmds.size()));
+    std::size_t total = 0;
+    for (auto& r : read_cmd_dir(dir, JournalFormat::Binary).second) total += r.size();
+    CHECK(total == 1200) << "800 checkpointed away";
 }
 
 int main(int argc, char** argv) {
