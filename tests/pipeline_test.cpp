@@ -503,6 +503,39 @@ TEST(append_continues_the_last_segment_after_a_checkpoint) {
     CHECK(total == 1200) << "800 checkpointed away";
 }
 
+TEST(automatic_checkpoints_keep_the_directory_recoverable) {
+    auto cfg = fuzz_cfg();
+    auto cmds = fuzz_corpus(15, 20000, 8);
+    auto dir = scratch(SCRATCH, "ckpt-auto");
+    Snapshot last;
+    {
+        auto p = Pipeline<FifoCore>::builder().book_config(cfg).partitions(3).journal(jcfg(dir, JournalFormat::Binary))
+                     .checkpoint_every(std::chrono::milliseconds(20)).build();
+        for (std::size_t i = 0; i < cmds.size(); i += 500) {
+            p->publish_batch(cmds.data() + i, std::min<std::size_t>(500, cmds.size() - i));
+            std::this_thread::sleep_for(3ms);
+        }
+        last = p->snapshot();
+        p->shutdown();
+    }
+    auto cps = list_checkpoints(dir);
+    CHECK(cps.size() == 1 && cps[0].first > 0) << "one automatic checkpoint remains";
+    auto snap = read_snapshot(cps[0].second);
+    PartitionMap m;
+    PartitionMap::make(3, {}, m);
+    auto rec = recover<FifoCore>(cfg, m, &snap, std::make_optional(std::make_pair(dir, JournalFormat::Binary)),
+                                 [](auto, auto, auto, auto&) {});
+    CHECK(rec.last_iseq == cmds.size());
+    auto book = rec.book;
+    auto p2 = Pipeline<FifoCore>::builder().book_config(book).partition_map(m).initial(std::move(rec).into_initial()).build();
+    CHECK(p2->snapshot().body == last.body) << "the directory recovers the final state";
+    p2->shutdown();
+    bool threw = false;
+    try { Pipeline<FifoCore>::builder().checkpoint_every(std::chrono::milliseconds(5)).build(); }
+    catch (const Error& e) { threw = e.kind == Error::Kind::Config; }
+    CHECK(threw) << "needs journals";
+}
+
 int main(int argc, char** argv) {
     SCRATCH = argc > 2 ? argv[2] : "build/scratch";
     fs::create_directories(SCRATCH);

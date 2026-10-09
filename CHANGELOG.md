@@ -6,6 +6,8 @@
 - `repair_dir` / `orderrecover --repair` truncate a torn final record.
 - `Pipeline::checkpoint()` rotates journals onto segments at a clean cut,
   writes the snapshot durably and removes covered segments.
+- `PipelineBuilder::checkpoint_every(interval)`: automatic checkpoints from
+  a background thread with its own `Handle` (stopped first at shutdown).
 - `orderrun --checkpoint-every K` and `--durable`; ctest runs the vendored
   `spec/conformance.sh`.
 

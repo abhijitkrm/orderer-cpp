@@ -256,6 +256,10 @@ class PipelineBuilder {
     /// Threads running the partitions' egress plugs (partition p → p % n).
     PipelineBuilder& egress_threads(std::size_t n) { egress_threads_ = std::max<std::size_t>(n, 1); return *this; }
     PipelineBuilder& initial(Initial<C> i) { initial_ = std::move(i); return *this; }
+    /// Take a checkpoint (spec/JOURNAL.md §6) every `interval` from a
+    /// background thread. Needs journals; shutdown stops the thread first; a
+    /// failed checkpoint fails the pipeline.
+    PipelineBuilder& checkpoint_every(std::chrono::nanoseconds interval) { checkpoint_every_ = interval; return *this; }
     std::unique_ptr<Pipeline<C>> build() { return std::unique_ptr<Pipeline<C>>(new Pipeline<C>(*this)); }
 
   private:
@@ -271,6 +275,7 @@ class PipelineBuilder {
     bool timestamps_ = false;
     std::size_t egress_threads_ = 1;
     std::optional<Initial<C>> initial_;
+    std::optional<std::chrono::nanoseconds> checkpoint_every_;
 };
 
 /// A running pipeline. Destroying it shuts it down.
@@ -297,9 +302,12 @@ class Pipeline {
 
     /// Barrier: returns once every command published before the call has been
     /// applied and delivered to every egress plug.
-    void drain() {
+    void drain() { drain_on(*handle_); }
+
+  private:
+    void drain_on(Handle& h) {
         std::uint64_t epoch = sh_->next_epoch.fetch_add(1) + 1;
-        publish_ctl(Control::Barrier, epoch);
+        publish_ctl(Control::Barrier, epoch, h);
         detail::wait_until(*sh_, [&] {
             for (std::uint32_t p = 0; p < sh_->partitions; ++p)
                 if (sh_->egress_epoch[p].v.load(std::memory_order_acquire) < epoch) return false;
@@ -308,16 +316,20 @@ class Pipeline {
     }
 
     /// A consistent snapshot of every book, cut at this point of the ingress order.
-    Snapshot snapshot() { return snapshot_op(Control::Snapshot); }
+  public:
+    Snapshot snapshot() { return snapshot_op(Control::Snapshot, *handle_); }
 
     /// A checkpoint (spec/JOURNAL.md §6): a snapshot cut here; every journal
     /// rotates onto a new segment at the cut; the snapshot is written durably
     /// into the journal directory; older segments and checkpoints go.
-    Snapshot checkpoint() {
+    Snapshot checkpoint() { return checkpoint_on(*handle_); }
+
+  private:
+    Snapshot checkpoint_on(Handle& h) {
         if (!sh_->journal) throw Error(Error::Kind::Config, "checkpoint needs journals");
         const auto& cfg = *sh_->journal;
-        Snapshot s = snapshot_op(Control::Checkpoint);
-        drain();  // every egress has rotated its event journal
+        Snapshot s = snapshot_op(Control::Checkpoint, h);
+        drain_on(h);  // every egress has rotated its event journal
         try {
             auto path = checkpoint_path(cfg.dir, s.iseq);
             write_durably(path, s.body);
@@ -330,14 +342,13 @@ class Pipeline {
         return s;
     }
 
-  private:
-    Snapshot snapshot_op(Control ctl) {
+    Snapshot snapshot_op(Control ctl, Handle& h) {
         std::uint64_t op = sh_->next_op.fetch_add(1) + 1;
         {
             std::lock_guard<std::mutex> g(sh_->snaps_m);
             sh_->snaps[op].remaining = sh_->partitions;
         }
-        publish_ctl(ctl, op);
+        publish_ctl(ctl, op, h);
         std::unique_lock<std::mutex> g(sh_->snaps_m);
         for (;;) {
             if (sh_->failed.load()) { g.unlock(); sh_->check(); }
@@ -363,6 +374,14 @@ class Pipeline {
     void shutdown() {
         if (shut_) { sh_->check(); return; }
         shut_ = true;
+        if (ckpt_.joinable()) {  // a checkpoint in progress finishes first
+            {
+                std::lock_guard<std::mutex> g(ckpt_m_);
+                ckpt_stop_ = true;
+            }
+            ckpt_cv_.notify_all();
+            ckpt_.join();
+        }
         sh_->closed.store(true, std::memory_order_seq_cst);
         std::vector<std::shared_ptr<detail::InFlight>> flags;
         {
@@ -391,10 +410,10 @@ class Pipeline {
   private:
     friend class PipelineBuilder<C>;
 
-    void publish_ctl(Control c, std::uint64_t arg) {
+    void publish_ctl(Control c, std::uint64_t arg, Handle& h) {
         sh_->check();
         if (sh_->closed.load(std::memory_order_seq_cst)) throw Error(Error::Kind::Closed, "pipeline closed");
-        auto r = handle_->ingress_.publish([&](CmdMsg& m) {
+        auto r = h.ingress_.publish([&](CmdMsg& m) {
             m.symbol = 0; m.t_pub = 0; m.arg = arg; m.ctl = c;
         });
         if (r != disruptor::Publish::Ok) throw Error(Error::Kind::Closed, "pipeline closed");
@@ -445,6 +464,7 @@ class Pipeline {
     };
 
     explicit Pipeline(PipelineBuilder<C>& b) {
+        if (b.checkpoint_every_ && !b.journal_) throw Error(Error::Kind::Config, "checkpoint_every needs journals");
         if (!b.map_) {
             PartitionMap m;
             if (auto e = PartitionMap::make(b.partitions_, {}, m)) throw Error(Error::Kind::Config, *e);
@@ -543,6 +563,28 @@ class Pipeline {
         sh_->add_alert([gctl]() mutable { gctl.alert(); });
         threads_.emplace_back(router_thread, sh_, std::move(rcons[0]), std::move(inboxes), map_, next_iseq);
         handle_ = std::make_unique<Handle>(std::move(ingress), sh_);
+        if (b.checkpoint_every_) {
+            auto interval = *b.checkpoint_every_;
+            ckpt_ = std::thread([this, interval, h = *handle_]() mutable {
+                std::unique_lock<std::mutex> g(ckpt_m_);
+                for (;;) {
+                    if (ckpt_cv_.wait_for(g, interval, [&] { return ckpt_stop_; })) return;
+                    if (sh_->failed.load()) return;
+                    g.unlock();
+                    try {
+                        checkpoint_on(h);
+                    } catch (const Error& e) {
+                        if (e.kind != Error::Kind::Closed && e.kind != Error::Kind::Failed)
+                            sh_->fail(std::string("checkpoint: ") + e.what());
+                        return;
+                    } catch (const std::exception& e) {
+                        sh_->fail(std::string("checkpoint: ") + e.what());
+                        return;
+                    }
+                    g.lock();
+                }
+            });
+        }
     }
 
     template <class F>
@@ -701,6 +743,10 @@ class Pipeline {
     std::vector<std::thread> threads_;
     std::unique_ptr<Handle> handle_;
     bool shut_ = false;
+    std::thread ckpt_;
+    std::mutex ckpt_m_;
+    std::condition_variable ckpt_cv_;
+    bool ckpt_stop_ = false;
 };
 
 }  // namespace orderer
