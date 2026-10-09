@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: orderer-spec/1.2
+## 0.2.0 (orderer-spec/1.2)
 
 - Binary journals are version 2 (CRC-32C per record); version 1 still reads.
 - `repair_dir` / `orderrecover --repair` truncate a torn final record.
@@ -13,7 +13,7 @@
 - `orderrun --checkpoint-every K` and `--durable`; ctest runs the vendored
   `spec/conformance.sh`.
 
-## Unreleased: v0.1.0 candidate (implements orderer-spec/1.1)
+## 0.1.0 (orderer-spec/1.1)
 
 - Port of orderer-rust to header-only C++20. It is byte-identical across
   listings, JSONL and binary journals at every P, snapshots, recovery and

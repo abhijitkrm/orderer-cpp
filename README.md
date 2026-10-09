@@ -16,6 +16,21 @@ Handle::publish ─▶ ingress ─▶ router ─┬─▶ inbox[p] ─▶ engine
                    producer)   route) └─▶ …            apply)
 ```
 
+## Install
+
+Header-only. Either install the CMake package:
+
+```bash
+cmake -S . -B build && cmake --install build --prefix /usr/local
+```
+
+```cmake
+find_package(orderer 0.2 CONFIG REQUIRED)
+target_link_libraries(app PRIVATE orderer::orderer)
+```
+
+or vendor it with `FetchContent` (tag `v0.2.0`) and link `orderer`.
+
 ## Quick start
 
 ```cpp

@@ -226,5 +226,5 @@ int main(int argc, char** argv) {
                 (unsigned long long)mean, (unsigned long long)pct(row.lat, 0.5), (unsigned long long)pct(row.lat, 0.9),
                 (unsigned long long)pct(row.lat, 0.99), (unsigned long long)pct(row.lat, 0.999),
                 (unsigned long long)(row.lat.empty() ? 0 : row.lat.back()), cfg.str().c_str());
-    std::fprintf(stderr, "env: %s / orderer-cpp 0.1.0\n", cpu().c_str());
+    std::fprintf(stderr, "env: %s / orderer-cpp 0.2.0\n", cpu().c_str());
 }
