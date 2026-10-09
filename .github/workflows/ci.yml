@@ -63,7 +63,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: abhijitkrm/matcher-cpp
-          ref: 5ddb7d2c2deb2e72b2d9a7fc09e27293bb2511b1
+          ref: 55091ea877d515b9ddf0c2c524367a526e7f45e1
           path: upstream/matcher-cpp
       - uses: dtolnay/rust-toolchain@stable
       - run: upstream/orderer/scripts/diffuzz.sh 4 10000

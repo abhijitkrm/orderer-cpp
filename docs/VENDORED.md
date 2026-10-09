@@ -10,8 +10,8 @@ matcher's spec and corpus.
 
 - **upstream**: `orderer`
 - **repo**: `https://github.com/abhijitkrm/orderer`
-- **commit**: `21bf70c8880e08226d978cacb531522fa7a03b68`
-- **tag**: `orderer-spec/1.2` (draft)
+- **commit**: `6a46583cf1fc3aee1e5c2c935143b14d8d716067`
+- **tag**: `orderer-spec/1.2`, plus matcher `06b5403` (bench docs only)
 - **paths**: `spec=spec vectors=vectors`
 
 `docs/VENDORED.sha256` holds every file's checksum. `scripts/vendored.sh`
@@ -21,16 +21,17 @@ against the pinned commit.
 ## 2. The matching core
 
 `include/matcher/` is [matcher-cpp](https://github.com/abhijitkrm/matcher-cpp)'s
-`include/matcher/` at `5ddb7d2c2deb2e72b2d9a7fc09e27293bb2511b1`. That commit includes the two fixes found
+`include/matcher/` at `55091ea877d515b9ddf0c2c524367a526e7f45e1`. That commit includes three fixes found
 while building orderer:
 
 - `1285f6c`: OrderMap backward-shift deletion
 - `5ddb7d2`: `Engine` no longer builds a book per command
+- `55091ea`: the ladder rescans the next best price through a summary bitmap, and an emptied side resets the cursor at once (it used to scan the whole ladder).
 
 To check it:
 
 ```bash
-git -C ../matcher-cpp diff --stat 5ddb7d2c2deb2e72b2d9a7fc09e27293bb2511b1 -- include/matcher && diff -r ../matcher-cpp/include/matcher include/matcher
+git -C ../matcher-cpp diff --stat 55091ea877d515b9ddf0c2c524367a526e7f45e1 -- include/matcher && diff -r ../matcher-cpp/include/matcher include/matcher
 ```
 
 orderer's strict parsing (`include/orderer/flat.hpp`) wraps the core rather

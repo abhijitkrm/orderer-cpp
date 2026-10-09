@@ -162,12 +162,14 @@ struct LevelDepth {
     Qty qty;
 };
 
-// Direct-indexed ladder + occupancy bitmap + top-of-book cursor.
+// Direct-indexed ladder + occupancy bitmap + top-of-book cursor. summary bit
+// w is set iff bits[w] != 0, so rescan skips 4096 empty ticks per word.
 struct LadderIndex {
     Price base;
     Side side;
     std::vector<Level> levels;
     std::vector<std::uint64_t> bits;
+    std::vector<std::uint64_t> summary;
     std::uint32_t count = 0;
     std::uint32_t best = NIL;
 
@@ -175,6 +177,7 @@ struct LadderIndex {
         std::size_t span = std::size_t(pmax - pmin) + 1;
         levels.assign(span, Level{});
         bits.assign((span + 63) / 64, 0);
+        summary.assign((bits.size() + 63) / 64, 0);
     }
 
     std::size_t idx(Price p) const { return std::size_t(p - base); }
@@ -197,6 +200,7 @@ struct LadderIndex {
         Level& l = levels[i];
         if (l.empty()) {
             bits[i / 64] |= 1ull << (i % 64);
+            summary[i / 4096] |= 1ull << ((i / 64) % 64);
             ++count;
             if (best == NIL || (side == Side::Bid && std::uint32_t(i) > best) ||
                 (side == Side::Ask && std::uint32_t(i) < best)) {
@@ -209,26 +213,42 @@ struct LadderIndex {
     void unlink_level(Price p) {
         auto i = idx(p);
         if (!levels[i].empty()) return;
-        bits[i / 64] &= ~(1ull << (i % 64));
+        std::size_t w = i / 64;
+        bits[w] &= ~(1ull << (i % 64));
+        if (!bits[w]) summary[w / 64] &= ~(1ull << (w % 64));
         --count;
-        if (std::uint32_t(i) == best) best = rescan(i);
+        if (count == 0) best = NIL;
+        else if (std::uint32_t(i) == best) best = rescan(i);
     }
 
+    // Next occupied index moving inward from `from` (inclusive): higher for
+    // asks, lower for bids.
     std::uint32_t rescan(std::size_t from) const {
+        std::size_t w = from / 64;
         if (side == Side::Ask) {
-            for (std::size_t i = from; i < levels.size();) {
-                std::size_t w = i / 64;
-                std::uint64_t word = bits[w] & (~0ull << (i % 64));
-                if (word) return std::uint32_t(w * 64 + __builtin_ctzll(word));
-                i = w * 64 + 64;
+            if (std::uint64_t word = bits[w] & (~0ull << (from % 64)))
+                return std::uint32_t(w * 64 + __builtin_ctzll(word));
+            // next non-empty word above w, via the summary
+            for (std::size_t s = w + 1; s < bits.size();) {
+                std::size_t sw = s / 64;
+                if (std::uint64_t sword = summary[sw] & (~0ull << (s % 64))) {
+                    std::size_t nw = sw * 64 + __builtin_ctzll(sword);
+                    return std::uint32_t(nw * 64 + __builtin_ctzll(bits[nw]));
+                }
+                s = sw * 64 + 64;
             }
             return NIL;
         }
-        for (std::int64_t i = std::int64_t(from); i >= 0;) {
-            std::size_t w = std::size_t(i) / 64;
-            std::uint64_t word = bits[w] & (~0ull >> (63 - (std::size_t(i) % 64)));
-            if (word) return std::uint32_t(w * 64 + 63 - __builtin_clzll(word));
-            i = std::int64_t(w) * 64 - 1;
+        if (std::uint64_t word = bits[w] & (~0ull >> (63 - from % 64)))
+            return std::uint32_t(w * 64 + 63 - __builtin_clzll(word));
+        // next non-empty word below w, via the summary
+        for (std::int64_t s = std::int64_t(w) - 1; s >= 0;) {
+            std::size_t sw = std::size_t(s) / 64;
+            if (std::uint64_t sword = summary[sw] & (~0ull >> (63 - std::size_t(s) % 64))) {
+                std::size_t nw = sw * 64 + 63 - __builtin_clzll(sword);
+                return std::uint32_t(nw * 64 + 63 - __builtin_clzll(bits[nw]));
+            }
+            s = std::int64_t(sw) * 64 - 1;
         }
         return NIL;
     }
