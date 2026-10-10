@@ -443,6 +443,14 @@ inline Body split_body(const fs::path& p, const std::string& bytes, JournalForma
         std::size_t n = body / size;
         if (body % size && mode == ReadMode::Strict) corrupt(p, "torn tail (partial record)");
         auto d = reinterpret_cast<const std::uint8_t*>(bytes.data());
+        if (mode == ReadMode::Repair) {
+            // 1.3: zero records an interrupted write left (§5.1)
+            auto zero = [&](std::size_t i) {
+                const std::uint8_t* r = d + HEADER + i * size;
+                return std::all_of(r, r + size, [](std::uint8_t x) { return x == 0; });
+            };
+            while (n > 0 && zero(n - 1)) --n;
+        }
         if (b.header.version >= 2) {
             for (std::size_t i = 0; i < n; ++i) {
                 if (!sealed(d + HEADER + i * size, payload_size(b.header.kind))) {
@@ -570,21 +578,58 @@ inline std::vector<std::string> read_evt_partition(const fs::path& dir, JournalF
 
 /// spec/JOURNAL.md §5.1: truncate a torn tail off each journal family's last
 /// segment, in place. Returns (file, bytes removed) per truncation.
+/// A segment that cannot hold a record (spec/JOURNAL.md 1.3 §5.1): JSONL with
+/// no newline at all, or binary with an invalid header and nothing but zeros
+/// after it.
+inline bool headerless(const fs::path& path, const std::string& bytes, JournalFormat f) {
+    if (f == JournalFormat::Jsonl) return bytes.find('\n') == std::string::npos;
+    if (bytes.size() > HEADER &&
+        !std::all_of(bytes.begin() + HEADER, bytes.end(), [](char x) { return x == 0; }))
+        return false;
+    try {
+        parse_binary_header(path, bytes);
+        return false;
+    } catch (const CorruptJournal&) {
+        return true;
+    }
+}
+
 inline std::vector<std::pair<fs::path, std::uint64_t>> repair_dir(const fs::path& dir, JournalFormat f) {
     std::vector<std::pair<fs::path, std::uint64_t>> out;
     for (Kind k : {Kind::Cmd, Kind::Evt}) {
-        std::map<std::uint32_t, fs::path> last;
-        for (auto& s : list_segments(dir, k, f)) last[s.partition] = s.path;
-        for (auto& [p, path] : last) {
-            std::string bytes = read_file(path);
-            Body b = split_body(path, bytes, f, ReadMode::Repair);
-            if (b.valid_len < bytes.size()) {
+        std::map<std::uint32_t, std::vector<Segment>> parts;
+        for (auto& s : list_segments(dir, k, f)) parts[s.partition].push_back(s);
+        for (auto& [p, segs] : parts) {
+            std::sort(segs.begin(), segs.end());
+            // 1.3: drop trailing segments a crash left without a usable
+            // header; the segment before becomes the last
+            while (!segs.empty() && segs.back().start > 0) {
+                const fs::path& path = segs.back().path;
+                std::string bytes = read_file(path);
+                if (!headerless(path, bytes, f)) break;
                 std::error_code ec;
-                fs::resize_file(path, b.valid_len, ec);
+                fs::remove(path, ec);
                 if (ec) corrupt(path, ec.message());
-                int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
-                if (fd >= 0) { ::fsync(fd); ::close(fd); }
-                out.push_back({path, bytes.size() - b.valid_len});
+                int dfd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
+                if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+                out.push_back({path, bytes.size()});
+                segs.pop_back();
+            }
+            // repair the last segment; while it holds no records, the one
+            // before it too (its writer may still have been finishing it)
+            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+                const fs::path& path = it->path;
+                std::string bytes = read_file(path);
+                Body b = split_body(path, bytes, f, ReadMode::Repair);
+                if (b.valid_len < bytes.size()) {
+                    std::error_code ec;
+                    fs::resize_file(path, b.valid_len, ec);
+                    if (ec) corrupt(path, ec.message());
+                    int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+                    if (fd >= 0) { ::fsync(fd); ::close(fd); }
+                    out.push_back({path, bytes.size() - b.valid_len});
+                }
+                if (!b.records.empty()) break;
             }
         }
     }
