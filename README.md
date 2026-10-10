@@ -5,7 +5,7 @@
 The C++20 implementation of [orderer](https://github.com/abhijitkrm/orderer):
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book. It is
-header-only, has no dependencies, and implements `orderer-spec/1.2`. It is
+header-only, has no dependencies, and implements `orderer-spec/1.3`. It is
 a port of [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -29,7 +29,7 @@ find_package(orderer 0.2 CONFIG REQUIRED)
 target_link_libraries(app PRIVATE orderer::orderer)
 ```
 
-or vendor it with `FetchContent` (tag `v0.2.0`) and link `orderer`.
+or vendor it with `FetchContent` (tag `v0.2.1`) and link `orderer`.
 
 ## Quick start
 
