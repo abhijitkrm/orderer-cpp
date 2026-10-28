@@ -350,7 +350,8 @@ class Pipeline {
             PartitionStats ps;
             ps.partition = p;
             ps.inbox_depth = depth(inbox_ctl_[p].published(), inbox_ctl_[p].consumed());
-            ps.outbox_depth = depth(outbox_ctl_[p].published(), outbox_ctl_[p].consumed());
+            // inline egress has no outbox ring
+            ps.outbox_depth = p < outbox_ctl_.size() ? depth(outbox_ctl_[p].published(), outbox_ctl_[p].consumed()) : 0;
             ps.commands = sh_->counters[p]->commands.load(std::memory_order_relaxed);
             ps.events = sh_->counters[p]->events.load(std::memory_order_relaxed);
             ps.flushed_iseq = sh_->journal ? sh_->flushed[p]->load(std::memory_order_acquire) : UINT64_MAX;

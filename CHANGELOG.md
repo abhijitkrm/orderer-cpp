@@ -8,6 +8,8 @@
   otherwise). Same events, same order (`pipeline_test`). With the protocol's
   instrumentation, M1, real core P=3: 27.6M -> 34.0M; neutral or slower at other
   P; no-op core P=2 without instrumentation: 68M -> 101M.
+- Fix: `Pipeline::stats()` read a per-partition outbox ring that inline egress does not
+  have; now 0, with a test.
 - `orderbench --latency on|off` (off stops stamping and sampling commands, two
   clock reads per command; default on) and `--egress thread|inline`. Journals-off
   pipeline without the instrumentation: real core P=3 28M -> 40M, no-op P=2

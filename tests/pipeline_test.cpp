@@ -615,6 +615,24 @@ TEST(inline_egress_requires_journals_off) {
     CHECK(refused) << "inline egress with journals must be refused";
 }
 
+TEST(inline_egress_has_stats_without_an_outbox) {
+    // stats() reads each partition's ring depths; inline egress has no outbox
+    auto cmds = fuzz_corpus(5, 2000, 8);
+    auto p = Pipeline<FifoCore>::builder()
+                 .book_config(fuzz_cfg())
+                 .partitions(3)
+                 .egress_placement(EgressPlacement::Inline)
+                 .build();
+    p->publish_batch(cmds);
+    p->drain();
+    auto st = p->stats();
+    CHECK(st.partitions.size() == 3);
+    std::uint64_t total = 0;
+    for (auto& s : st.partitions) { CHECK(s.outbox_depth == 0); total += s.commands; }
+    CHECK(total == cmds.size());
+    p->shutdown();
+}
+
 int main(int argc, char** argv) {
     SCRATCH = argc > 2 ? argv[2] : "build/scratch";
     fs::create_directories(SCRATCH);
