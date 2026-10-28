@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `EgressPlacement::Inline` (`PipelineBuilder::egress_placement`, default `Thread`):
+  the engine thread runs the egress plugs itself, with no outbox ring, egress
+  thread or per-event copy. Journals must be off (`Error::Kind::Config`
+  otherwise). Same events, same order (`pipeline_test`). With the protocol's
+  instrumentation, M1, real core P=3: 27.6M -> 34.0M; neutral or slower at other
+  P; no-op core P=2 without instrumentation: 68M -> 101M.
+- `orderbench --latency on|off` (off stops stamping and sampling commands, two
+  clock reads per command; default on) and `--egress thread|inline`. Journals-off
+  pipeline without the instrumentation: real core P=3 28M -> 40M, no-op P=2
+  47M -> 67M.
+
 ## 0.2.1 (orderer-spec/1.3)
 
 - Vendors matcher-cpp 55091ea: the price ladder finds the next best price through a

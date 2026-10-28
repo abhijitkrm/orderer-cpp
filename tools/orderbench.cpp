@@ -77,12 +77,15 @@ struct PipeOpts {
     std::optional<JournalConfig> journal;
     Waits waits = Waits::low_latency();
     std::size_t ingress = 1 << 14, inbox = 1 << 12, outbox = 1 << 13;
+    bool latency = true;  // stamp commands and sample end-to-end latency (the BENCH.md protocol)
+    EgressPlacement egress = EgressPlacement::Thread;
 };
 
 template <class C>
 static std::unique_ptr<Pipeline<C>> build(const BookConfig& book, const PipeOpts& o, std::optional<EgressFactory> m) {
     auto b = Pipeline<C>::builder();
     b.book_config(book).partitions(o.partitions).waits(o.waits).ring_sizes(o.ingress, o.inbox, o.outbox);
+    b.egress_placement(o.egress);
     if (o.journal) b.journal(*o.journal);
     if (m) b.egress(*m);
     return b.build();
@@ -104,7 +107,7 @@ static Row pipe_mode(const Corpus& setup, const Corpus& run, const PipeOpts& o) 
     p->drain();
     std::vector<std::vector<std::pair<Symbol, Command>>> streams(o.producers);
     for (auto& sc : run.cmds) streams[sc.first % o.producers].push_back(sc);
-    p->set_timestamps(true);
+    p->set_timestamps(o.latency);
     std::barrier start(std::ptrdiff_t(o.producers + 1));
     std::vector<std::thread> ts;
     for (auto& s : streams) {
@@ -148,10 +151,10 @@ int main(int argc, char** argv) {
     const std::string usage =
         "orderbench <prefix> --mode core|pipe [--partitions P] [--producers N] [--journal binary|jsonl|off] "
         "[--journal-dir DIR] [--fsync N] [--tag NAME] [--core fifo|noop] [--waits relaxed|low] [--batch N] "
-        "[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS]";
+        "[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--latency on|off] [--egress thread|inline]";
     Args a(argc, argv, usage,
            {"--mode", "--partitions", "--producers", "--journal", "--journal-dir", "--fsync", "--tag", "--core",
-            "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--baseline"},
+            "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--baseline", "--latency", "--egress"},
            {});
     if (a.positional.size() != 1) die(usage);
     std::string prefix = a.positional[0];
@@ -188,8 +191,14 @@ int main(int argc, char** argv) {
         std::string w = a.get("--waits").value_or("low");
         if (w == "relaxed") o.waits = Waits::relaxed();
         else if (w != "low") die("--waits: unknown " + w);
+        std::string lat = a.get("--latency").value_or("on");
+        if (lat == "off") o.latency = false;
+        else if (lat != "on") die("--latency: unknown " + lat);
+        std::string eg = a.get("--egress").value_or("thread");
+        if (eg == "inline") o.egress = EgressPlacement::Inline;
+        else if (eg != "thread") die("--egress: unknown " + eg);
         config.push_back("journal=" + jm + " fsync=" + std::to_string(fsync));
-        for (std::string k : {"--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events"})
+        for (std::string k : {"--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--latency", "--egress"})
             if (auto v = a.get(k)) config.push_back(k.substr(2) + "=" + *v);
         std::string core = a.get("--core").value_or("fifo");
         try {

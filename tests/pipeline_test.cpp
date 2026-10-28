@@ -566,6 +566,55 @@ TEST(stats_count_commands_events_and_fsyncs) {
     p->shutdown();
 }
 
+// ---- inline egress --------------------------------------------------------------------------
+
+static std::vector<std::vector<std::string>> run_placed(BookConfig cfg, const Cmds& cmds, std::uint32_t P,
+                                                         EgressPlacement placement) {
+    auto [f, h] = collect(true);
+    auto p = Pipeline<FifoCore>::builder()
+                 .book_config(cfg)
+                 .partitions(P)
+                 .ring_sizes(1 << 10, 1 << 8, 1 << 8)
+                 .egress_placement(placement)
+                 .egress(f)
+                 .build();
+    p->publish_batch(cmds);
+    p->drain();
+    p->shutdown();
+    std::vector<std::vector<std::string>> out;
+    for (auto& b : h->take()) out.push_back(lines(b));
+    return out;
+}
+
+TEST(inline_egress_matches_thread_egress) {
+    auto cfg = fuzz_cfg();
+    for (std::uint64_t seed = 1; seed <= 6; ++seed) {
+        auto cmds = fuzz_corpus(seed, 4000, 8);
+        for (std::uint32_t P : {1u, 2u, 3u, 4u, 7u}) {
+            auto threaded = run_placed(cfg, cmds, P, EgressPlacement::Thread);
+            auto inlined = run_placed(cfg, cmds, P, EgressPlacement::Inline);
+            CHECK(inlined == threaded) << "seed " << seed << " P=" << P << ": inline egress changed the streams";
+            CHECK(dense(concat(inlined))) << "seq density";
+        }
+    }
+}
+
+TEST(inline_egress_requires_journals_off) {
+    auto dir = scratch(SCRATCH, "inline-egress-journal");
+    bool refused = false;
+    try {
+        auto p = Pipeline<FifoCore>::builder()
+                     .book_config(fuzz_cfg())
+                     .partitions(2)
+                     .journal(jcfg(dir, JournalFormat::Binary))
+                     .egress_placement(EgressPlacement::Inline)
+                     .build();
+    } catch (const Error& e) {
+        refused = std::string(e.what()).find("inline egress") != std::string::npos;
+    }
+    CHECK(refused) << "inline egress with journals must be refused";
+}
+
 int main(int argc, char** argv) {
     SCRATCH = argc > 2 ? argv[2] : "build/scratch";
     fs::create_directories(SCRATCH);

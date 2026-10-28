@@ -242,6 +242,18 @@ class Handle {
 template <class C>
 class Pipeline;
 
+/// Where the egress plugs run.
+enum class EgressPlacement {
+    /// Egress threads fed by a per-partition outbox ring (the default).
+    Thread,
+    /// The engine thread calls the plugs itself right after applying each
+    /// command: no outbox ring, no egress thread, no per-event copy. Plugs run
+    /// on the engine's critical path, so keep them cheap. Requires journals off:
+    /// the event journal and the ack gating on durability are egress-thread work
+    /// (Error::Kind::Config otherwise). Plugs see the same events in the same order.
+    Inline,
+};
+
 template <class C>
 class PipelineBuilder {
   public:
@@ -257,6 +269,8 @@ class PipelineBuilder {
     PipelineBuilder& timestamps(bool on) { timestamps_ = on; return *this; }
     /// Threads running the partitions' egress plugs (partition p → p % n).
     PipelineBuilder& egress_threads(std::size_t n) { egress_threads_ = std::max<std::size_t>(n, 1); return *this; }
+    /// Where the egress plugs run (default EgressPlacement::Thread).
+    PipelineBuilder& egress_placement(EgressPlacement p) { egress_placement_ = p; return *this; }
     PipelineBuilder& initial(Initial<C> i) { initial_ = std::move(i); return *this; }
     /// Take a checkpoint (spec/JOURNAL.md §6) every `interval` from a
     /// background thread. Needs journals; shutdown stops the thread first; a
@@ -276,6 +290,7 @@ class PipelineBuilder {
     std::vector<EgressFactory> egress_;
     bool timestamps_ = false;
     std::size_t egress_threads_ = 1;
+    EgressPlacement egress_placement_ = EgressPlacement::Thread;
     std::optional<Initial<C>> initial_;
     std::optional<std::chrono::nanoseconds> checkpoint_every_;
 };
@@ -489,6 +504,10 @@ class Pipeline {
 
     explicit Pipeline(PipelineBuilder<C>& b) {
         if (b.checkpoint_every_ && !b.journal_) throw Error(Error::Kind::Config, "checkpoint_every needs journals");
+        const bool inline_egress = b.egress_placement_ == EgressPlacement::Inline;
+        if (inline_egress && b.journal_)
+            throw Error(Error::Kind::Config,
+                        "inline egress requires journals off (the event journal and ack gating run on egress threads)");
         if (!b.map_) {
             PartitionMap m;
             if (auto e = PartitionMap::make(b.partitions_, {}, m)) throw Error(Error::Kind::Config, *e);
@@ -555,34 +574,46 @@ class Pipeline {
             sh_->add_alert([ictl]() mutable { ictl.alert(); });
             inboxes.push_back(std::move(inbox));
 
-            disruptor::RingBuilder<EvtMsg> ob(b.outbox_);
-            ob.consumer({}, b.waits_.egress);
-            auto [outbox, outbox_cons] = ob.build_single();
-            auto octl = outbox.control();
-            outbox_ctl_.push_back(octl);
-            sh_->add_alert([octl]() mutable { octl.alert(); });
-
-            std::optional<JournalFormat> fmt;
-            if (journaled) fmt = b.journal_->format;
-            std::optional<Segmenter> seg;
-            if (journaled) seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Cmd, p, P, b.book_};
-            threads_.emplace_back(engine_thread, sh_, std::move(inbox_cons[0]), std::move(outbox),
-                                  std::move(cores[p]), std::move(cmd_w[p]), fmt, seg, sh_->counters[p]);
+            std::optional<disruptor::SingleProducer<EvtMsg>> outbox;
+            std::vector<disruptor::Consumer<EvtMsg>> outbox_cons;
+            if (!inline_egress) {
+                disruptor::RingBuilder<EvtMsg> ob(b.outbox_);
+                ob.consumer({}, b.waits_.egress);
+                auto [ob_prod, ob_cons] = ob.build_single();
+                outbox.emplace(std::move(ob_prod));
+                outbox_cons = std::move(ob_cons);
+                auto octl = outbox->control();
+                outbox_ctl_.push_back(octl);
+                sh_->add_alert([octl]() mutable { octl.alert(); });
+            }
 
             EgressCtx ctx{p, P, sh_->epoch, sh_->durable[p]};
-            EgressPart part{p, std::move(outbox_cons[0]), {}, ctx};
+            std::vector<std::unique_ptr<Egress>> plugs;
             if (evt_w[p]) {
                 auto ej = std::make_unique<EvtJournal>();
                 ej->w = std::move(evt_w[p]);
                 ej->f = b.journal_->format;
                 ej->seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Evt, p, P, b.book_};
-                part.plugs.push_back(std::move(ej));
+                plugs.push_back(std::move(ej));
             }
-            for (auto& f : factories) part.plugs.push_back(f(ctx));
-            egress_groups[p % n_egress].push_back(std::move(part));
+            for (auto& f : factories) plugs.push_back(f(ctx));
+
+            std::optional<JournalFormat> fmt;
+            if (journaled) fmt = b.journal_->format;
+            std::optional<Segmenter> seg;
+            if (journaled) seg = Segmenter{b.journal_->dir, b.journal_->format, Kind::Cmd, p, P, b.book_};
+            std::vector<std::unique_ptr<Egress>> inline_plugs;
+            if (inline_egress) inline_plugs = std::move(plugs);
+            threads_.emplace_back(engine_thread, sh_, std::move(inbox_cons[0]), std::move(outbox), inline_egress,
+                                  std::move(inline_plugs), p, std::move(cores[p]), std::move(cmd_w[p]), fmt, seg,
+                                  sh_->counters[p]);
+            if (!inline_egress) {
+                EgressPart part{p, std::move(outbox_cons[0]), std::move(plugs), ctx};
+                egress_groups[p % n_egress].push_back(std::move(part));
+            }
         }
-        for (auto& g : egress_groups)
-            threads_.emplace_back(egress_thread, sh_, std::move(g), journaled);
+        if (!inline_egress)
+            for (auto& g : egress_groups) threads_.emplace_back(egress_thread, sh_, std::move(g), journaled);
 
         disruptor::RingBuilder<CmdMsg> rb(b.ingress_);
         rb.consumer({}, b.waits_.router);
@@ -652,7 +683,8 @@ class Pipeline {
     }
 
     static void engine_thread(std::shared_ptr<detail::Shared> sh, disruptor::Consumer<CmdMsg> inbox,
-                              disruptor::SingleProducer<EvtMsg> out, C core, std::unique_ptr<ChunkWriter> journal,
+                              std::optional<disruptor::SingleProducer<EvtMsg>> out, bool inline_egress,
+                              std::vector<std::unique_ptr<Egress>> iplugs, std::uint32_t p, C core, std::unique_ptr<ChunkWriter> journal,
                               std::optional<JournalFormat> fmt, std::optional<Segmenter> seg,
                               std::shared_ptr<EngineCounters> counters) {
         guarded(*sh, "engine", [&] {
@@ -672,10 +704,17 @@ class Pipeline {
                         ++n_commands;
                         core.apply(m.symbol, m.cmd, [&](Symbol s, std::uint64_t seq, const Event& ev) {
                             ++n_events;
-                            out.stage([&](EvtMsg& e) {
-                                e.iseq = iseq; e.seq = seq; e.t_pub = t_pub; e.arg = 0;
-                                e.symbol = s; e.ctl = Control::None; e.ev = ev;
-                            });
+                            if (inline_egress) {  // no outbox, no copy, no hop
+                                EvtMsg em;
+                                em.iseq = iseq; em.seq = seq; em.t_pub = t_pub; em.arg = 0;
+                                em.symbol = s; em.ctl = Control::None; em.ev = ev;
+                                for (auto& pl : iplugs) pl->on_event(em);
+                            } else {
+                                out->stage([&](EvtMsg& e) {
+                                    e.iseq = iseq; e.seq = seq; e.t_pub = t_pub; e.arg = 0;
+                                    e.symbol = s; e.ctl = Control::None; e.ev = ev;
+                                });
+                            }
                         });
                     } else {
                         // the new segment starts at this cut, before the snapshot is reported
@@ -702,16 +741,32 @@ class Pipeline {
                         } else {
                             force = true;
                         }
-                        out.stage([&](EvtMsg& e) {
-                            e.iseq = m.iseq; e.seq = 0; e.t_pub = 0; e.arg = m.arg;
-                            e.symbol = 0; e.ctl = m.ctl;
-                        });
+                        if (inline_egress) {  // what the egress thread does for a control
+                            if (m.ctl == Control::Barrier) {
+                                for (auto& pl : iplugs) { pl->on_batch_end(); pl->on_idle(); }
+                                sh->egress_epoch[p].v.store(m.arg, std::memory_order_release);
+                            } else if (m.ctl == Control::Checkpoint) {
+                                for (auto& pl : iplugs) pl->on_checkpoint(m.iseq);
+                            }
+                        } else {
+                            out->stage([&](EvtMsg& e) {
+                                e.iseq = m.iseq; e.seq = 0; e.t_pub = 0; e.arg = m.arg;
+                                e.symbol = 0; e.ctl = m.ctl;
+                            });
+                        }
                     }
-                    if (eob) out.commit();
+                    if (eob) {
+                        if (out) out->commit();
+                        for (auto& pl : iplugs) pl->on_batch_end();
+                    }
                 });
                 if (n) {
                     counters->commands.store(n_commands, std::memory_order_relaxed);
                     counters->events.store(n_events, std::memory_order_relaxed);
+                }
+                if (inline_egress) {
+                    if (stop) for (auto& pl : iplugs) { pl->on_idle(); pl->on_shutdown(); }
+                    else if (n == 0) for (auto& pl : iplugs) pl->on_idle();
                 }
                 if (stop || inbox.is_alerted()) break;
                 if (journal && journal->pending() &&
@@ -722,7 +777,7 @@ class Pipeline {
                 if (n == 0) inbox.idle();
                 else inbox.reset_idle();
             }
-            out.commit();
+            if (out) out->commit();
         });
     }
 
