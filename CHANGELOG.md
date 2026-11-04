@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `include/orderer/cluster/`: the replication runtime's storage and wire layer, byte-compatible with orderer-rust: CRC-32C (hardware where targeted), SHA-256/HMAC and the pre-shared-key session MAC, the message / WAL-frame / command-batch codec, the write-ahead log (torn and zero-filled tails cut, mid-file damage refused) and the snapshot store. `tests/cluster_wire_test.cpp` checks it against fixtures Rust wrote (`vectors/replication-wire/`, 17 WAL states, messages, batches, snapshots): same values, same re-encoded bytes, same recovered disk, and WAL and snapshot files written here equal Rust's byte for byte.
+
 - `include/orderer/consensus.hpp`: the replication protocol core (`spec/REPLICATION.md`), ported from orderer-rust and proved against the shared conformance vectors (`vectors/replication/`: 28 traces, 28,000 recorded drain points, byte-identical effects and state). Only the protocol core is ported; the WAL, transport and replica runtime are not.
 
 - `EgressPlacement::Inline` (`PipelineBuilder::egress_placement`, default `Thread`):

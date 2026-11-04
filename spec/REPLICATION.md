@@ -427,3 +427,11 @@ recorded effect and state line byte for byte; each port's test also fails when
 a vector line is altered. The ports have no simulator of their own: the
 vectors carry what the Rust simulator exercised, and no more. A behaviour the
 simulator never reached is not covered in any port.
+
+Runtime ports are checked against `vectors/replication-wire/` (see its README):
+protocol messages, WAL frame bodies, command batches, WAL files in every
+damaged state with their expected recovery, and snapshots. A port must decode
+and re-encode them identically, recover the same disk image from every WAL
+(torn and zero-filled tails cut, mid-file damage refused), and write
+byte-identical `good` WAL and snapshot files. orderer-cpp implements the
+storage and wire layer against them (`include/orderer/cluster/`).
