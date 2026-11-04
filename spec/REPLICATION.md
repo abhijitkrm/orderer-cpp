@@ -407,9 +407,9 @@ it does not scale.
 * Throughput on real multi-machine hardware, with a real NIC and NVMe, and
   Linux fsync behaviour. Everything above is one laptop.
 * The replication **runtime** (WAL, snapshots, transport, replica, client,
-  sessions, authentication) exists only in orderer-rust. C++, Go, Java and
-  TypeScript have the **protocol core** only (§13.9); each still needs its own
-  storage, network and client layers.
+  sessions, authentication) exists in orderer-rust and orderer-cpp (§13.10).
+  Go, Java and TypeScript have the **protocol core** only (§13.9); each still
+  needs its own storage, network and client layers.
 * `unsafe` was added in one place, behind the `hwcrc` feature (runtime CPU
   detection, tested equal to the portable code): the third sanctioned site
   after `affinity` and `prefetch`.
@@ -435,3 +435,29 @@ and re-encode them identically, recover the same disk image from every WAL
 (torn and zero-filled tails cut, mid-file damage refused), and write
 byte-identical `good` WAL and snapshot files. orderer-cpp implements the
 storage and wire layer against them (`include/orderer/cluster/`).
+
+### 13.10 The C++ runtime and mixed-language clusters
+
+`orderer-cpp/include/orderer/cluster/` implements the whole runtime: CRC-32C,
+SHA-256 / HMAC and the session MAC, the codec, WAL and snapshot store,
+transport, replica (driver, WAL and applier threads), the client protocol with
+sessions and `barrier()`, and the state machines `RecorderSm` and `DedupSm`.
+It is checked three ways:
+
+* **Fixtures** (`vectors/replication-wire/`): decodes and re-encodes every
+  message, WAL frame body and command batch identically to Rust; recovers the
+  same disk image from all 17 WAL states; and the WAL and snapshot files it
+  writes are byte-identical to Rust's.
+* **16 end-to-end tests** over real TCP and files (the list in §13.4, less the
+  pipeline-specific ones), clean under ThreadSanitizer and AddressSanitizer.
+* **Mixed clusters** (`orderer-cpp/scripts/interop.sh`): replicas of both
+  languages in one cluster, driven by the Rust load tool, with `kill -9` of the
+  leader several times. Passed for rust-rust-cpp, cpp-cpp-rust, cpp-cpp-cpp,
+  a five-node cpp-rust-cpp-rust-cpp, and rust-cpp-cpp with the authenticated
+  handshake on: every acknowledged batch survived on every replica in the same
+  order exactly once, and replicas of both languages ended with the same state
+  digest. That last point exercises, across languages, the log, snapshots
+  digests, sessions and HMAC handshake.
+
+The mixed clusters use the language-neutral `RecorderSm`, not the matching
+pipeline. orderer-cpp's pipeline is not wired in as a replicated state machine.

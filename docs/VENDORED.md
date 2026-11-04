@@ -10,7 +10,7 @@ matcher's spec and corpus.
 
 - **upstream**: `orderer`
 - **repo**: `https://github.com/abhijitkrm/orderer`
-- **commit**: `3b5fc486235ff8159ce1aee4054df5f2b12c30be`
+- **commit**: `f9001281db85d4a826c3370a16c0801b66346f49`
 - **tag**: `orderer-spec/1.3` plus unreleased replication spec and vectors
 - **paths**: `spec=spec vectors=vectors`
 
