@@ -42,6 +42,9 @@ endforeach()
 add_executable(orderer_node tools/orderer_node.cpp)
 target_link_libraries(orderer_node PRIVATE orderer)
 
+add_executable(clusterbench tools/clusterbench.cpp)
+target_link_libraries(clusterbench PRIVATE orderer)
+
 add_executable(quickstart examples/quickstart.cpp)
 target_link_libraries(quickstart PRIVATE orderer)
 

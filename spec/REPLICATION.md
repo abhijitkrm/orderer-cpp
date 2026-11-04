@@ -459,5 +459,38 @@ It is checked three ways:
   digest. That last point exercises, across languages, the log, snapshots
   digests, sessions and HMAC handshake.
 
-The mixed clusters use the language-neutral `RecorderSm`, not the matching
-pipeline. orderer-cpp's pipeline is not wired in as a replicated state machine.
+The first mixed-cluster runs used the language-neutral `RecorderSm`. The C++
+runtime now also runs **the matching pipeline as the replicated state machine**
+(`cluster/pipeline_sm.hpp`, `orderer_node --sm pipeline`, the default), and the
+same mixed clusters pass with it: replicas of both languages end with the same
+state digest, which is a SHA-256 over `iseq | partitions | matcher-snap/1`, so
+the Rust and C++ matching engines reach a byte-identical order book. With
+`COMPACT=100 DOWN=5` the script forces lagging replicas to catch up by snapshot
+and counts the installs by language pair: snapshots built from live pipeline
+state crossed the boundary in both directions (in four configurations, for
+example 4 of 4 installs across languages for rust-cpp-cpp and for cpp-rust-rust)
+and every replica still ended in the same digest.
+
+### 13.11 C++ throughput
+
+`orderer-cpp`'s `clusterbench` takes the same flags and prints the same line as
+orderer-rust's. Best of 5, interleaved, on the same busy 8-core M1 as §13.6
+(all replicas and producers in one process), M commands/s acked / applied on
+every node:
+
+| Configuration | Rust | C++ |
+|---|---|---|
+| 3 nodes, no-op state machine, no fsync | 16.7 / 16.5 | 19.2 / 18.4 |
+| 3 nodes, matching pipeline (P = 2), no fsync | 7.8 / 6.0 | 7.7 / 5.4 |
+| 1 node, matching pipeline (P = 2), no fsync | 28.3 / 21.9 | 24.5 / 15.8 |
+| 3 nodes, no-op, fsync on a quorum | 8.4-8.6 | 8.6-8.9 |
+
+The replication runtime is not slower in C++. The single-node pipeline gap is
+the C++ matcher and pipeline themselves: a profile puts about 43% of busy time
+in the order-book code and only a few percent in decoding and publishing. Two
+findings made the C++ runtime competitive. Building a sealed 48-byte journal
+record per command to take 32 of its bytes cost 30% of the producers' time; a
+direct 32-byte writer replaced it, with identical bytes (the fixtures prove
+it). And log entries are immutable shared buffers (`consensus::Bytes`), so the
+seven copies a 32 KB payload takes through a replica are reference-count
+bumps. Measure on separate machines before relying on any of these numbers.

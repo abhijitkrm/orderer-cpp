@@ -366,7 +366,11 @@ private:
             case Event::Kind::Inbound: {
                 Inbound& in = ev.in;
                 if (in.kind == Inbound::Kind::Msg) node_->step(in.from, std::move(in.msg));
-                else if (in.kind == Inbound::Kind::Snapshot) node_->install_snapshot(in.from, in.term, in.index, in.last_term);
+                else if (in.kind == Inbound::Kind::Snapshot) {
+                    std::fprintf(stderr, "orderer-cluster node %d: installing snapshot %llu from node %d\n", int(cfg_.id),
+                                 static_cast<unsigned long long>(in.index), int(in.from));
+                    node_->install_snapshot(in.from, in.term, in.index, in.last_term);
+                }
                 else { digests_[in.index][in.from] = in.digest; check_digests(in.index); }
                 break;
             }

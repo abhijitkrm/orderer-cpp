@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `cluster/pipeline_sm.hpp`: the matching pipeline as the replicated state machine (`orderer_node --sm pipeline`, now the default), producing the same state bytes and digest as orderer-rust. Mixed Rust/C++ clusters pass with it, including cross-language snapshot transfer (`COMPACT=100 DOWN=5 scripts/interop.sh`). `tools/clusterbench.cpp`: the replicated-path throughput benchmark, same flags and output as orderer-rust's. Log entry payloads are immutable shared buffers (`consensus::Bytes`) and commands are written directly in their 32-byte wire form instead of through a sealed journal record.
+
 - `orderer_node` (tools/): a replica process with the same command line and client protocol as orderer-rust's `orderer-node`, and `scripts/interop.sh`, which runs mixed Rust/C++ clusters under load with `kill -9` of leaders (also with the authenticated handshake) and requires one applied sequence and one state digest across both languages.
 
 - The replication runtime (`include/orderer/cluster/`): TCP transport with per-peer reconnecting senders, chunked verified snapshot streaming and the pre-shared-key handshake, the replica (driver, WAL and applier threads; acknowledge at commit; back-pressure; digest divergence halt; compaction), the client protocol with a leader-following `Client`, exactly-once sessions (`DedupSm`), linearizable `barrier()`, and `RecorderSm`. `tests/cluster_e2e_test.cpp`: 16 end-to-end tests over real TCP and files (failover with no acknowledged loss, partitions, snapshot catch-up, restarts, torn and corrupt WALs, divergence, authentication, sessions, stale reads, hostile input, a slow state machine), clean under ThreadSanitizer and AddressSanitizer.

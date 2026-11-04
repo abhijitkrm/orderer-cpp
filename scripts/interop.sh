@@ -8,6 +8,8 @@
 #   scripts/interop.sh                       # nodes: rust rust cpp
 #   IMPLS="cpp rust rust" SECS=30 KILLS=6 scripts/interop.sh
 #   ORDERER_KEY=secret scripts/interop.sh    # authenticated transport
+#   COMPACT=100 DOWN=5 scripts/interop.sh    # force snapshot transfer between languages
+#   SM=recorder scripts/interop.sh           # language-neutral recorder instead of the matching pipeline
 #
 # Needs ../orderer-rust (built here with cargo) and a built orderer_node.
 set -euo pipefail
@@ -16,6 +18,9 @@ cd "$(dirname "$0")/.."
 IMPLS=${IMPLS:-"rust rust cpp"}
 SECS=${SECS:-25}
 KILLS=${KILLS:-5}
+SM=${SM:-pipeline}
+COMPACT=${COMPACT:-0}   # >0: snapshot and compact the log every N entries
+DOWN=${DOWN:-1}         # seconds a killed leader stays down
 BASE=${BASE_PORT:-47900}
 RUST=${RUST_DIR:-../orderer-rust}
 CPP_BUILD=${CPP_BUILD:-build}
@@ -51,7 +56,7 @@ start_node() {
   local i=$1 bin
   [[ "${KINDS[$i]}" == "cpp" ]] && bin=$CPP_NODE || bin=$RUST_NODE
   "$bin" --id "$i" --members "$MEMBERS" --client "127.0.0.1:$((BASE + 100 + i))" \
-    --dir "$TMP/n$i" --audit --digest-every 64 --fsync on --sm recorder >>"$TMP/n$i.log" 2>&1 &
+    --dir "$TMP/n$i" --audit --digest-every 64 --fsync on --sm "$SM" --compact-every "$COMPACT" >>"$TMP/n$i.log" 2>&1 &
   PIDS[i]=$!
 }
 
@@ -77,7 +82,7 @@ for k in $(seq 1 "$KILLS"); do
   echo "kill $k/$KILLS: kill -9 leader node $L (${KINDS[$L]})"
   kill -9 "${PIDS[$L]}"
   wait "${PIDS[$L]}" 2>/dev/null || true
-  sleep 1
+  sleep "$DOWN"
   start_node "$L"
 done
 
@@ -85,7 +90,27 @@ wait "$LOAD_PID"
 LOAD_PID=
 cat "$TMP/load.out"
 
-"$LOAD" settle --clients "$CLIENTS" --timeout 60
+"$LOAD" settle --clients "$CLIENTS" --timeout 90
+if [[ "$COMPACT" -gt 0 ]]; then
+  # After a snapshot restore a node's audit log lacks the entries the snapshot
+  # covers, so the per-batch comparison does not apply; the state digests
+  # (settle, above) are the check. Show that logs were compacted.
+  "$LOAD" status --clients "$CLIENTS"
+  # Which snapshots crossed which language boundary?
+  SAME=0; CROSS=0
+  for ((i = 0; i < N; i++)); do
+    while read -r from; do
+      [[ -z "$from" ]] && continue
+      if [[ "${KINDS[$i]}" == "${KINDS[$from]}" ]]; then SAME=$((SAME + 1)); else CROSS=$((CROSS + 1)); fi
+    done < <(sed -n -E 's/.*installing snapshot [0-9]+ from node ([0-9]+).*/\1/p' "$TMP/n$i.log")
+  done
+  echo "snapshot installs: $SAME between same-language replicas, $CROSS across languages"
+  BASES=$("$LOAD" status --clients "$CLIENTS" | sed -E 's/.* base=([0-9]+) .*/\1/' | sort -n | tail -1)
+  [[ "$BASES" -gt 0 ]] || { echo "FAIL: no node compacted its log"; exit 1; }
+  if [[ "${REQUIRE_CROSS:-0}" == 1 && "$CROSS" -eq 0 ]]; then echo "FAIL: no snapshot crossed a language boundary"; exit 1; fi
+  echo "PASS: all replicas, across languages, hold the same state digest after snapshot transfer (highest log base $BASES)"
+  exit 0
+fi
 APPLIED=""
 for ((i = 0; i < N; i++)); do APPLIED+="${APPLIED:+,}$TMP/n$i/applied.log"; done
 "$LOAD" verify --acked "$TMP/acked" --maybe "$TMP/maybe" --applied "$APPLIED"

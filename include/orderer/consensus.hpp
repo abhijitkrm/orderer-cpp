@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -44,9 +46,35 @@ private:
     std::uint64_t s_;
 };
 
+/// Immutable, cheaply copyable bytes. A log entry's payload is copied several
+/// times on its way through a replica (log, WAL write, one message per
+/// follower); sharing the buffer turns each copy into a reference-count bump.
+class Bytes {
+public:
+    Bytes() = default;
+    Bytes(std::vector<std::uint8_t> v) : p_(std::make_shared<const std::vector<std::uint8_t>>(std::move(v))) {}
+    Bytes(std::initializer_list<std::uint8_t> il) : Bytes(std::vector<std::uint8_t>(il)) {}
+    const std::uint8_t* data() const { return p_ ? p_->data() : nullptr; }
+    std::size_t size() const { return p_ ? p_->size() : 0; }
+    bool empty() const { return size() == 0; }
+    const std::uint8_t* begin() const { return data(); }
+    const std::uint8_t* end() const { return data() + size(); }
+    std::uint8_t operator[](std::size_t i) const { return (*p_)[i]; }
+    /// A copy of the contents as a vector.
+    std::vector<std::uint8_t> vec() const { return p_ ? *p_ : std::vector<std::uint8_t>{}; }
+    operator std::vector<std::uint8_t>() const { return vec(); }
+    bool operator==(const Bytes& o) const {
+        if (p_ == o.p_) return true;
+        return size() == o.size() && (size() == 0 || std::memcmp(data(), o.data(), size()) == 0);
+    }
+
+private:
+    std::shared_ptr<const std::vector<std::uint8_t>> p_;
+};
+
 struct Entry {
     Term term = 0;
-    std::vector<std::uint8_t> data;
+    Bytes data;
     bool operator==(const Entry&) const = default;
 };
 

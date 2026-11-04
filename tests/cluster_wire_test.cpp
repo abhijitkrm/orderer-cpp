@@ -50,8 +50,6 @@ fs::path scratch(const std::string& name) {
     return d;
 }
 
-std::string hexstr(const std::vector<std::uint8_t>& b) { return b.empty() ? "" : hex(b.data(), b.size()); }
-
 }  // namespace
 
 TEST(crc_matches_the_check_value_and_the_bytewise_journal_crc) {

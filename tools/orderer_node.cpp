@@ -4,9 +4,10 @@
 //
 //   orderer_node --id N --members 0=HOST:PORT,1=HOST:PORT,... --client HOST:PORT
 //                --dir DIR [--compact-every N] [--digest-every N]
-//                [--fsync on|off] [--audit] [--sm recorder]
+//                [--fsync on|off] [--audit] [--sm pipeline|recorder] [--partitions P]
 //
-// The state machine is the language-neutral RecorderSm (wrapped in DedupSm).
+// The state machine is the matching pipeline (default) or the language-neutral
+// RecorderSm, wrapped in DedupSm.
 // `--audit` appends `(log index, first order id)` for every applied batch to
 // DIR/applied.log (truncated at start), as the Rust node does. ORDERER_KEY in
 // the environment sets the pre-shared cluster key.
@@ -15,6 +16,7 @@
 #include <iostream>
 
 #include "orderer/cluster/client.hpp"
+#include "orderer/cluster/pipeline_sm.hpp"
 
 using namespace orderer::cluster;
 
@@ -60,7 +62,8 @@ int main(int argc, char** argv) {
     ReplicaConfig cfg;
     std::optional<int> id;
     std::optional<Addr> client;
-    std::string dir, sm_kind = "recorder";
+    std::string dir, sm_kind = "pipeline";
+    std::uint32_t partitions = 2;
     bool audit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -80,11 +83,11 @@ int main(int argc, char** argv) {
         else if (a == "--fsync") cfg.fsync = v("--fsync") == "on";
         else if (a == "--audit") audit = true;
         else if (a == "--sm") sm_kind = v("--sm");
-        else if (a == "--partitions") (void)v("--partitions");  // accepted for CLI compatibility
+        else if (a == "--partitions") partitions = static_cast<std::uint32_t>(std::stoul(v("--partitions")));
         else die("unknown argument " + a);
     }
     if (!id || !client || cfg.members.empty() || dir.empty()) die("--id, --members, --client and --dir are required");
-    if (sm_kind != "recorder") die("--sm " + sm_kind + ": this node supports recorder only");
+    if (sm_kind != "recorder" && sm_kind != "pipeline") die("--sm " + sm_kind + ": want pipeline or recorder");
     cfg.id = static_cast<NodeId>(*id);
     cfg.dir = std::filesystem::path(dir) / "state";
     cfg.max_pending = 1 << 16;
@@ -95,7 +98,10 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<std::ofstream> log;
     if (audit) log = std::make_unique<std::ofstream>(std::filesystem::path(dir) / "applied.log", std::ios::binary | std::ios::trunc);
-    auto sm = std::make_unique<DedupSm>(std::make_unique<Audited>(std::make_unique<RecorderSm>(), std::move(log)));
+    std::unique_ptr<StateMachine> inner;
+    if (sm_kind == "recorder") inner = std::make_unique<RecorderSm>();
+    else inner = PipelineSm<orderer::FifoCore>::counting(partitions);
+    auto sm = std::make_unique<DedupSm>(std::make_unique<Audited>(std::move(inner), std::move(log)));
 
     std::unique_ptr<Replica> replica;
     try { replica = Replica::start(cfg, std::move(sm)); }

@@ -17,6 +17,7 @@ namespace orderer::cluster {
 
 using orderer::consensus::Disk;
 using orderer::consensus::Effect;
+using orderer::consensus::Bytes;
 using orderer::consensus::Entry;
 using orderer::consensus::Index;
 using orderer::consensus::Msg;
@@ -67,7 +68,7 @@ inline Entry get_entry(Reader& r) {
     const std::size_t n = r.u32();
     if (n > MAX_ENTRY) throw CodecError("entry too large");
     const auto* p = r.bytes(n);
-    e.data.assign(p, p + n);
+    e.data = Bytes(std::vector<std::uint8_t>(p, p + n));
     return e;
 }
 inline void put_entries(std::vector<std::uint8_t>& o, const std::vector<Entry>& es) {
@@ -169,6 +170,36 @@ inline void apply_persist(Disk& d, const Persist& p) {
 
 using CmdSym = std::pair<matcher::Symbol, matcher::Command>;
 
+/// One command on the wire: the journal record's bytes 8..40 (symbol, cmd,
+/// side, otype, tif, order_id, price, qty) without iseq, checksum or padding.
+/// Written directly: building and sealing a full record per command costs more
+/// than everything else in the batch.
+inline void put_cmd32(std::uint8_t* r, matcher::Symbol sym, const matcher::Command& c) {
+    std::memset(r, 0, CMD_BYTES);
+    std::memcpy(r, &sym, 4);
+    std::memcpy(r + 8, &c.order_id, 8);
+    switch (c.kind) {
+        case matcher::Command::Kind::New: {
+            r[4] = 1;
+            r[5] = c.side == matcher::Side::Ask ? 1 : 0;
+            r[6] = c.otype == matcher::OType::Market ? 1 : 0;
+            r[7] = orderer::tif_code(c.tif);
+            const std::uint64_t price = std::uint64_t(c.price);
+            std::memcpy(r + 16, &price, 8);
+            std::memcpy(r + 24, &c.qty, 8);
+            break;
+        }
+        case matcher::Command::Kind::Cancel: r[4] = 2; break;
+        case matcher::Command::Kind::Replace: {
+            r[4] = 3;
+            const std::uint64_t price = std::uint64_t(c.price);
+            std::memcpy(r + 16, &price, 8);
+            std::memcpy(r + 24, &c.qty, 8);
+            break;
+        }
+    }
+}
+
 /// `n` commands: 0x01 | n u32 | n * 32 bytes (a journal record minus iseq,
 /// checksum and padding); the session form is 0x02 | client u64 | seq u64 | n | ...
 inline void encode_batch(const CmdSym* cmds, std::size_t n, std::vector<std::uint8_t>& o,
@@ -176,11 +207,9 @@ inline void encode_batch(const CmdSym* cmds, std::size_t n, std::vector<std::uin
     if (session) { put_u8(o, TAG_SESSION_BATCH); put_u64(o, session->first); put_u64(o, session->second); }
     else put_u8(o, TAG_BATCH);
     put_u32(o, static_cast<std::uint32_t>(n));
-    std::uint8_t rec[orderer::CMD_RECORD];
-    for (std::size_t i = 0; i < n; ++i) {
-        orderer::encode_cmd(0, cmds[i].first, cmds[i].second, rec);
-        o.insert(o.end(), rec + 8, rec + 8 + CMD_BYTES);
-    }
+    const std::size_t at = o.size();
+    o.resize(at + n * CMD_BYTES);
+    for (std::size_t i = 0; i < n; ++i) put_cmd32(o.data() + at + i * CMD_BYTES, cmds[i].first, cmds[i].second);
 }
 
 /// The session a payload belongs to, if any, without decoding commands.

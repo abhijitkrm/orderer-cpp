@@ -41,7 +41,11 @@ public:
         if (int d = s_->apply_delay_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(d));
         std::lock_guard g(s_->m);
         Entry c = e;
-        if (s_->corrupt_at == i && !c.data.empty()) c.data[0] ^= 0xff;
+        if (s_->corrupt_at == i && !c.data.empty()) {
+            auto v = c.data.vec();
+            v[0] ^= 0xff;
+            c.data = Bytes(std::move(v));
+        }
         s_->sm.apply(i, c);
     }
     std::vector<std::uint8_t> snapshot(Index i) override { std::lock_guard g(s_->m); return s_->sm.snapshot(i); }
