@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `include/orderer/consensus.hpp`: the replication protocol core (`spec/REPLICATION.md`), ported from orderer-rust and proved against the shared conformance vectors (`vectors/replication/`: 28 traces, 28,000 recorded drain points, byte-identical effects and state). Only the protocol core is ported; the WAL, transport and replica runtime are not.
+
 - `EgressPlacement::Inline` (`PipelineBuilder::egress_placement`, default `Thread`):
   the engine thread runs the egress plugs itself, with no outbox ring, egress
   thread or per-event copy. Journals must be off (`Error::Kind::Config`
