@@ -407,9 +407,9 @@ it does not scale.
 * Throughput on real multi-machine hardware, with a real NIC and NVMe, and
   Linux fsync behaviour. Everything above is one laptop.
 * The replication **runtime** (WAL, snapshots, transport, replica, client,
-  sessions, authentication) exists in orderer-rust and orderer-cpp (§13.10).
-  Go, Java and TypeScript have the **protocol core** only (§13.9); each still
-  needs its own storage, network and client layers.
+  sessions, authentication, scale-out client) exists in all five languages:
+  orderer-rust, orderer-cpp (§13.10), orderer-go (§13.12), orderer-java
+  (§13.13) and orderer-ts (§13.14).
 * `unsafe` was added in one place, behind the `hwcrc` feature (runtime CPU
   detection, tested equal to the portable code): the third sanctioned site
   after `affinity` and `prefetch`.
@@ -433,8 +433,9 @@ protocol messages, WAL frame bodies, command batches, WAL files in every
 damaged state with their expected recovery, and snapshots. A port must decode
 and re-encode them identically, recover the same disk image from every WAL
 (torn and zero-filled tails cut, mid-file damage refused), and write
-byte-identical `good` WAL and snapshot files. orderer-cpp implements the
-storage and wire layer against them (`include/orderer/cluster/`).
+byte-identical `good` WAL and snapshot files. orderer-cpp (`include/orderer/cluster/`),
+orderer-go (`cluster/`), orderer-java (`...orderer.cluster`) and orderer-ts
+(`src/cluster/`) implement the storage and wire layer against them.
 
 ### 13.10 The C++ runtime and mixed-language clusters
 
@@ -494,3 +495,189 @@ direct 32-byte writer replaced it, with identical bytes (the fixtures prove
 it). And log entries are immutable shared buffers (`consensus::Bytes`), so the
 seven copies a 32 KB payload takes through a replica are reference-count
 bumps. Measure on separate machines before relying on any of these numbers.
+
+### 13.12 The Go runtime and three-language clusters
+
+`orderer-go/cluster/` is the third runtime: codec, WAL, snapshot store,
+authentication, transport, replica (driver, WAL and applier goroutines), client
+protocol with sessions and `Barrier`, `RecorderSm`, `DedupSm` and the matching
+pipeline as the replicated state machine (`PipelineSm`). CRC-32C, SHA-256 and
+HMAC come from the Go standard library; the rest follows the C++ runtime
+function for function, and `cmd/orderernode` takes the same command line as
+`orderer-node` and `orderer_node`. It is checked the same three ways:
+
+* **Fixtures** (`vectors/replication-wire/`): every message, WAL frame body and
+  command batch decodes and re-encodes identically to Rust; all 17 WAL states
+  recover the same disk image; the WAL and snapshot files written in Go are
+  byte-identical to Rust's. This passed on the first run.
+* **19 end-to-end tests** over real TCP and files: the 16 of §13.10, plus three
+  that run the matching pipeline (identical state digests on every replica,
+  catch-up by a snapshot of real book state, whole-cluster restart from disk).
+  Clean under the race detector, three runs in a row.
+* **Mixed clusters** (`orderer-go/scripts/interop.sh`, any mix of Go, Rust and
+  C++ replicas), driven by the Rust load tool with `kill -9` of the leader
+  several times. Passed: go-go-go, go-rust-go, rust-go-cpp, go-rust-cpp with
+  the authenticated handshake, cpp-go-rust with the recorder state machine, and
+  go-go-go with compaction. Every acknowledged batch survived on every replica
+  in the same order, exactly once, and replicas of all languages ended with the
+  same state digest. With `COMPACT=100 DOWN=5` on go-rust-cpp, three snapshot
+  installs crossed language boundaries and the digests still agreed.
+
+Go also has the scale-out client (`ShardMap`, `ShardedClient`; the group
+assignment is checked against values computed independently from the splitmix64
+definition, and two groups are tested end to end, including one group's outage
+leaving the other serving) and `orderload`, the port of `orderer-load` with the
+same modes and output. `interop.sh` drives clusters with `orderload` by default
+(`LOADER=rust` for Rust's): the mixed clusters above pass with it, including
+rust-go-cpp and go-rust-cpp with authentication and forced snapshot transfer (6
+installs, all across languages), and `orderload verify` fails, with exit status
+1, on a lost, duplicated, invented, reordered and divergent applied log.
+
+Throughput, `orderer-go`'s `clusterbench` (same flags and output line as the
+others) against orderer-rust's, interleaved on the §13.6 machine, which was
+busy (load average about 10 on 8 cores) while these ran. Best of 5 unless
+noted, M commands/s acked:
+
+| Configuration | Rust | Go |
+|---|---|---|
+| 3 nodes, no-op state machine, no fsync | 17.1 | 17.2 |
+| 1 node, no-op, no fsync | 50.3 | 46.9 |
+| 3 groups of 3 nodes, no-op, no fsync | 22.9 | 22.6 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 64 (best of 3) | 8.3 | 8.4 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 256 (best of 3) | 10.5 | 9.9 |
+| 3 nodes, no-op, fsync on a quorum, 2 producers, window 8 | 0.91 | 0.93 |
+| 3 nodes, matching pipeline (P = 2), no fsync | 11.0 | 4.2 |
+| 1 node, matching pipeline (P = 2), no fsync | 34.0 | 21.8 |
+| 3 nodes, matching pipeline, fsync, 4 producers, window 256 (best of 3) | 9.4 | 4.9 |
+
+The replication path costs the same in Go as in Rust wherever the state machine
+is cheap. The last two rows are the Go matcher and pipeline, as the profile
+shows: the busy time is in the order-book code (pool allocation and the price
+ladder) and in goroutine hand-offs, and decoding a batch is under 4%. Two
+settings mattered for a state machine whose three replicas share cores: running
+the counting egress inline on the engine goroutines (3.0 to 4.0 M/s), and
+keeping the default back-off waits, because busy-spinning three pipelines'
+router and engine goroutines on 8 cores collapses to 0.6 M/s. The window-8
+row is not a protocol limit: 16 batches in flight over an 18 ms durable ack is
+0.9 M/s in every language; a larger window lets group commit coalesce the
+fsyncs, which is what the window-64 and window-256 rows measure. Measure on separate machines
+before relying on any of these numbers.
+
+### 13.13 The Java runtime
+
+`orderer-java`'s `io.github.abhijitkrm.orderer.cluster` package is the fourth
+runtime, structured like the C++ and Go ones: `Wal`, `SnapStore`, `Transport`,
+`Replica` (driver, WAL and applier threads), `Client` / `ClientServer`,
+`RecorderSm`, `DedupSm`, `PipelineSm`, `ShardMap` / `ShardedClient`, and the
+tools `ordernode`, `orderload` and `clusterbench`. CRC-32C, SHA-256 and HMAC
+come from the JDK (the CRC is a hardware intrinsic). Checked the same three ways:
+
+* **Fixtures:** all of `vectors/replication-wire/` decodes and re-encodes
+  identically, all 17 WAL states recover the same image, and the WAL and
+  snapshot files written in Java are byte-identical to Rust's.
+* **26 end-to-end and scale-out tests**: 17 end-to-end tests (the 16
+  scenarios of §13.12, with the five-node and no-quorum cases as separate
+  tests), 3 that run the matching
+  pipeline (identical digests, snapshot catch-up from real book state, whole
+  restart), and 6 scale-out tests with the same golden group values as Go.
+  The end-to-end and pipeline suites passed three runs in a row.
+* **Mixed clusters** (`orderer-java/scripts/interop.sh`, any mix of Java, Rust,
+  C++ and Go; the load tool is Java's `orderload` unless `LOADER=rust|go`),
+  with `kill -9` of the leader: java-java-java, java-rust-java, rust-java-cpp,
+  go-java-rust, java-go-cpp with the authenticated handshake, rust-java-cpp with
+  the recorder state machine, and java-java-java with compaction all passed;
+  Go's and Rust's load tools also drive Java nodes. Every acknowledged batch
+  survived on every replica in the same order exactly once, and all replicas
+  ended with the same state digest. With `COMPACT=100 DOWN=5`, a four-language
+  cluster (java-rust-cpp-go) transferred snapshots across language boundaries
+  and still ended in one digest.
+
+One Java-specific limit. The price ladder holds one object per price tick, about
+70 MB per book at the default 0..1,000,000 range, so three in-process replicas
+of 64 symbols do not fit in memory; `clusterbench` takes `--pmax` (default
+20000) for that. Cluster nodes must keep the default range, because the
+snapshot header, and so the state digest, carries it.
+
+Throughput, `orderer-java`'s `clusterbench` against orderer-rust's, interleaved
+on the busy §13.6 machine (load average 7-13 while these ran, and another
+benchmark was running on it at times, so Rust's own figures moved by 2x between
+sessions). Best across two sessions, M commands/s acked:
+
+| Configuration | Rust | Java |
+|---|---|---|
+| 3 nodes, no-op state machine, no fsync | 14.4 | 9.9 |
+| 1 node, no-op, no fsync | 52.8 | 36.9 |
+| 3 groups of 3 nodes, no-op, no fsync | 22.8 | 11.5 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 64 | 8.6 | 7.2 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 256 | 13.5 | 9.6 |
+| 3 nodes, no-op, fsync on a quorum, 2 producers, window 8 | 0.89 | 0.87 |
+| 3 nodes, matching pipeline (P = 2), no fsync | 9.5 | 5.5 |
+| 1 node, matching pipeline (P = 2), no fsync | 33.7 | 18.7 |
+| 3 nodes, matching pipeline, fsync, 4 producers, window 256 | 9.2 | 4.8 |
+
+Java reaches about two thirds of Rust on the replication path and about half
+with the pipeline. A profile puts the producers' per-command `Command` objects
+and the pipeline's own allocation ahead of anything in the runtime; two fixes
+mattered (the batch encoder zeroed each command's bytes twice, and messages were
+encoded into a buffer that grew by doubling, copying a 32 KB payload several
+times before framing; both are gone). Under CPU contention a JVM stop-the-world
+collection can outlast the election timeout, and a 40 M-command run lost
+leadership once: that is the protocol working, not a fault, but it makes long
+single-process benchmarks of any language fragile on a loaded machine.
+
+### 13.14 The TypeScript runtime
+
+`orderer-ts/src/cluster/` is the fifth runtime, with the same pieces and tools
+(`orderernode`, `orderload`, `clusterbench`). Node's `zlib.crc32` is the IEEE
+polynomial, not Castagnoli, so CRC-32C is a slicing-by-8 table implementation;
+SHA-256 and HMAC come from `crypto`. Because JavaScript has one thread per
+isolate, the replica is one event-driven object rather than three threads:
+the WAL does group commit through an off-loop `fs.fsync`, and applies run in
+2 ms time slices on the same loop as the protocol. Two consequences follow.
+`StateMachine.apply` may return `false` ("call me again with this entry"), which
+`PipelineSm` uses with a non-blocking publish: the first version blocked the
+loop for seconds while engines created books, and the cluster lost its leader.
+And a single `apply` longer than the election timeout would stall the node, so
+the slow-leader test uses a backlog of 20 ms applies instead of one 700 ms apply.
+
+* **Fixtures:** the same as the other runtimes, including byte-identical WAL
+  and snapshot files; 10 wire tests.
+* **26 end-to-end and scale-out tests:** 20 end-to-end, three of them with
+  the matching pipeline, and 6 scale-out, with the same golden group values.
+* **Mixed clusters** (`orderer-ts/scripts/interop.sh`, any mix of TS, Rust, Go
+  and C++), with `kill -9` of the leader: ts-ts-ts, ts-rust-go, go-ts-cpp,
+  rust-cpp-ts, cpp-ts-go with the recorder state machine, ts-rust-cpp with the
+  authenticated handshake and compaction, and a four-language ts-rust-go-cpp
+  cluster with compaction and four kills (12 snapshot installs, all across
+  languages). Every acknowledged batch survived on every replica in the same
+  order exactly once, and every cluster ended in one state digest.
+
+Limits specific to this port. matcher-ts uses JavaScript numbers, so order ids,
+prices and quantities must stay below 2^53: TS's `orderload` uses ids below
+that, and the Rust and Go load tools cannot drive a TS node (`interop.sh` picks
+the TS loader when a TS replica is in the mix). matcher-ts's default book
+(`priceMax` 1,000,000) costs about 90 MB per symbol per replica; it has to stay
+the default for interop because the snapshot header carries it, and the TS-only
+tests and benchmark use a 20,000-level ladder.
+
+Throughput, `orderer-ts`'s `clusterbench` against orderer-rust's, interleaved,
+best of 3-5, on the same loaded machine (load average 9-11, so Rust's figures
+are about half their usual; the ratios matter more than the absolutes), M
+commands/s acked:
+
+| Configuration | Rust | TS |
+|---|---|---|
+| 3 nodes, no-op state machine, no fsync | 8.3 | 2.3 |
+| 1 node, no-op, no fsync | 50.8 | 6.4 |
+| 3 groups of 3 nodes, no-op, no fsync | 21.9 | 7.5 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 64 | 8.3 | 3.4 |
+| 3 nodes, no-op, fsync on a quorum, 4 producers, window 256 | 14.0 | 3.7 |
+| 3 nodes, no-op, fsync on a quorum, 2 producers, window 8 | 0.89 | 1.29 |
+| 3 nodes, matching pipeline (P = 2), no fsync | 8.0 | 0.89 |
+| 1 node, matching pipeline (P = 2), no fsync | 34.4 | 3.6 |
+| 3 nodes, matching pipeline, fsync, 4 producers, window 256 | 8.4 | 1.8 |
+
+The TS runtime does on one thread what Rust spreads over several, so it trails
+wherever the CPU is the limit. The window-8 row is bounded by the durable ack
+latency, not by the CPU. The matching-pipeline rows add matcher-ts's own cost
+(the per-language pipeline numbers in `docs/RESULTS.md`).
