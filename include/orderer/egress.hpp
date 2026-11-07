@@ -237,4 +237,104 @@ inline std::pair<EgressFactory, std::shared_ptr<MetricsHandle>> metrics(std::siz
     return {f, h};
 }
 
+// ---- EventDigest: a rolling hash of each partition's event stream -----------------
+
+/// One step of the event-chain hash: rotl((h ^ x) * K, 31). Pinned exactly
+/// (spec/REPLICATION.md 13.16): replicas of different languages compare these.
+inline std::uint64_t chain_step(std::uint64_t h, std::uint64_t x) {
+    const std::uint64_t v = (h ^ x) * 0x9E3779B97F4A7C15ull;
+    return (v << 31) | (v >> 33);
+}
+
+/// Fold one event into a chain: causing iseq, symbol and kind, per-book seq,
+/// then the kind's fields. Kinds: Accepted 1, Rejected 2, Trade 3, Closed 4,
+/// Replaced 5. Reasons are coded explicitly (the matcher's enums are declared
+/// in the spec's order: invalid_qty 0 ... book_full 6; filled 0, cancelled 1,
+/// expired 2), prices fold as their two's-complement u64.
+inline std::uint64_t chain_event(std::uint64_t h, const EvtMsg& m) {
+    const Event& e = m.ev;
+    std::uint64_t kind = 0;
+    switch (e.kind) {
+        case Event::Kind::Accepted: kind = 1; break;
+        case Event::Kind::Rejected: kind = 2; break;
+        case Event::Kind::Trade: kind = 3; break;
+        case Event::Kind::Closed: kind = 4; break;
+        case Event::Kind::Replaced: kind = 5; break;
+    }
+    h = chain_step(h, m.iseq);
+    h = chain_step(h, (std::uint64_t(m.symbol) << 8) | kind);
+    h = chain_step(h, m.seq);
+    switch (e.kind) {
+        case Event::Kind::Accepted:
+            h = chain_step(h, e.order_id);
+            return chain_step(h, e.leaves_qty);
+        case Event::Kind::Rejected:
+        case Event::Kind::Closed:
+            h = chain_step(h, e.order_id);
+            return chain_step(h, std::uint64_t(e.reason));
+        case Event::Kind::Trade:
+            h = chain_step(h, e.maker);
+            h = chain_step(h, e.taker);
+            h = chain_step(h, std::uint64_t(e.price));
+            return chain_step(h, e.qty);
+        case Event::Kind::Replaced:
+            h = chain_step(h, e.order_id);
+            h = chain_step(h, std::uint64_t(e.price));
+            return chain_step(h, e.qty);
+    }
+    return h;
+}
+
+/// One rolling hash per partition over the events it emits, kept by an egress
+/// plug. Replicas fed the same commands emit the same events, so their chains
+/// agree and a divergence in behaviour makes them differ. Reading is
+/// O(partitions): drain the pipeline, then values(). It does not see state that
+/// has not yet influenced an event (a resting order's price, say); the full
+/// snapshot hash covers that on demand.
+class EventDigest {
+  public:
+    /// `initial` seeds each chain (empty = zeros; a snapshot's values after a restore).
+    explicit EventDigest(std::uint32_t partitions, const std::vector<std::uint64_t>& initial = {})
+        : slots_(std::make_shared<Slots>(partitions)) {
+        for (std::uint32_t i = 0; i < partitions; ++i)
+            slots_->v[i].store(i < initial.size() ? initial[i] : 0, std::memory_order_relaxed);
+    }
+
+    /// Every partition's chain, as of the last pipeline drain.
+    std::vector<std::uint64_t> values() const {
+        std::vector<std::uint64_t> out(slots_->n);
+        for (std::uint32_t i = 0; i < slots_->n; ++i) out[i] = slots_->v[i].load(std::memory_order_acquire);
+        return out;
+    }
+
+    /// Register this with `PipelineBuilder::egress`.
+    EgressFactory factory() const {
+        auto slots = slots_;
+        return [slots](const EgressCtx& ctx) -> std::unique_ptr<Egress> {
+            struct DigestEgress final : Egress {
+                std::uint64_t h;
+                std::shared_ptr<Slots> slots;
+                std::uint32_t p;
+                void on_event(const EvtMsg& m) override { h = chain_event(h, m); }
+                // Published at batch ends and before a drain completes, not per event.
+                void on_batch_end() override { slots->v[p].store(h, std::memory_order_release); }
+                void on_shutdown() override { slots->v[p].store(h, std::memory_order_release); }
+            };
+            auto e = std::make_unique<DigestEgress>();
+            e->slots = slots;
+            e->p = ctx.partition;
+            e->h = slots->v[ctx.partition].load(std::memory_order_acquire);
+            return e;
+        };
+    }
+
+  private:
+    struct Slots {
+        explicit Slots(std::uint32_t n_) : n(n_), v(new std::atomic<std::uint64_t>[n_]) {}
+        std::uint32_t n;
+        std::unique_ptr<std::atomic<std::uint64_t>[]> v;
+    };
+    std::shared_ptr<Slots> slots_;
+};
+
 }  // namespace orderer

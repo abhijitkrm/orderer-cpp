@@ -288,7 +288,7 @@ private:
                 }
                 case Job::Kind::Hash: {
                     const Index at = sm_applied_.load(std::memory_order_acquire);
-                    auto d = sm_->digest(at);
+                    auto d = sm_->deep_digest(at);
                     job->hash_reply->set_value(d ? HashResult{{at, *d}} : std::nullopt);
                     break;
                 }

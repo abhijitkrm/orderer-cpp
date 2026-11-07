@@ -61,3 +61,18 @@ cmake -S . -B build-thread -DORDERER_SANITIZE=thread   # or address
 
 Requires C++20 (`<barrier>`, concepts). Tested with Apple clang 14 and GCC
 12+.
+
+## Replication digests
+
+The replicated pipeline (`include/orderer/cluster/pipeline_sm.hpp`) detects
+divergence with an event-chain digest (`spec/REPLICATION.md` 13.16): `EventDigest`
+is an egress plug that keeps one rolling 64-bit hash per partition over the events
+it emits, and `PipelineSm::digest()` hashes the commands applied, the partition
+count and those chains after one pipeline barrier, so its cost does not grow with
+the books. `deep_digest()` is the full-state hash (a snapshot of every book) and
+is what the client protocol's state hash returns, so tests that wait for
+quiescence still compare complete state across replicas and languages. The chain
+does not see state that has not yet influenced an event; `tests/event_digest_test.cpp`
+pins that down. Pipeline snapshots carry the chains (`PSM2` layout) so a replica
+that restores continues them.
+

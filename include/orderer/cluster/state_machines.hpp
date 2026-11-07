@@ -27,6 +27,9 @@ public:
     virtual std::optional<std::string> restore(Index index, const std::uint8_t* data, std::size_t n) = 0;
     /// A digest of the state, for divergence detection; nullopt = unsupported.
     virtual std::optional<Digest> digest(Index) { return std::nullopt; }
+    /// A digest of the whole state, however expensive, for on-demand checks
+    /// (the client protocol's state hash). Defaults to digest().
+    virtual std::optional<Digest> deep_digest(Index i) { return digest(i); }
 };
 
 /// Records every non-empty entry. Snapshot = the list `index u64 | len u32 |
@@ -109,6 +112,13 @@ public:
     }
     std::optional<Digest> digest(Index index) override {
         auto inner = inner_->digest(index);
+        if (!inner) return std::nullopt;
+        auto b = table_bytes();
+        b.insert(b.end(), inner->begin(), inner->end());
+        return sha256(b);
+    }
+    std::optional<Digest> deep_digest(Index index) override {
+        auto inner = inner_->deep_digest(index);
         if (!inner) return std::nullopt;
         auto b = table_bytes();
         b.insert(b.end(), inner->begin(), inner->end());

@@ -7,6 +7,11 @@
 // snapshots and digests is `iseq u64 | partitions u32 | matcher-snap/1 body`,
 // the same bytes orderer-rust produces, so replicas of the two languages
 // agree on digests.
+//
+// Divergence detection uses an EventDigest (spec/REPLICATION.md 13.16): a
+// rolling hash over the events each partition emits, so digest() costs one
+// pipeline barrier, not a snapshot of every book. deep_digest() is the full-state
+// hash, computed on demand.
 #pragma once
 
 #include <functional>
@@ -21,11 +26,13 @@ template <class C = FifoCore>
 class PipelineSm : public StateMachine {
 public:
     /// Builds a pipeline, optionally from restored state. It must configure
-    /// `book` and `map`'s partition count, and no journaling.
-    using Build = std::function<std::unique_ptr<Pipeline<C>>(std::optional<Initial<C>>)>;
+    /// `book` and `map`'s partition count, no journaling, and register the
+    /// EventDigest it is given (`.egress(digest.factory())`).
+    using Build = std::function<std::unique_ptr<Pipeline<C>>(std::optional<Initial<C>>, EventDigest)>;
 
-    PipelineSm(BookConfig book, PartitionMap map, Build build) : book_(book), map_(std::move(map)), build_(std::move(build)) {
-        pipeline_ = build_(std::nullopt);
+    PipelineSm(BookConfig book, PartitionMap map, Build build)
+        : book_(book), map_(std::move(map)), build_(std::move(build)), partitions_(map_.partitions()), chains_(partitions_) {
+        pipeline_ = build_(std::nullopt, chains_);
     }
     ~PipelineSm() override { if (pipeline_) { try { pipeline_->shutdown(); } catch (...) {} } }
 
@@ -33,10 +40,10 @@ public:
     static std::unique_ptr<PipelineSm> counting(std::uint32_t partitions, BookConfig book = BookConfig{}) {
         PartitionMap map;
         if (auto e = PartitionMap::make(partitions, {}, map)) throw std::runtime_error(*e);
-        return std::make_unique<PipelineSm>(book, map, [partitions, book](std::optional<Initial<C>> init) {
+        return std::make_unique<PipelineSm>(book, map, [partitions, book](std::optional<Initial<C>> init, EventDigest digest) {
             auto [factory, handle] = metrics(0);
             auto b = Pipeline<C>::builder();
-            b.book_config(book).partitions(partitions).egress(std::move(factory)).timestamps(false);
+            b.book_config(book).partitions(partitions).egress(std::move(factory)).egress(digest.factory()).timestamps(false);
             if (init) b.initial(std::move(*init));
             return b.build();
         });
@@ -48,16 +55,22 @@ public:
         catch (const CodecError&) { ++bad_entries_; return; }  // every replica skips it identically
         if (cmds.empty()) return;
         if (pipeline_->publish_batch(cmds.data(), cmds.size()) != orderer::Status::Ok) throw std::runtime_error("pipeline rejected committed commands");
+        iseq_ += cmds.size();
     }
 
-    std::vector<std::uint8_t> snapshot(Index) override { return encode_state(); }
+    std::vector<std::uint8_t> snapshot(Index) override { return encode_snapshot(); }
 
     std::optional<std::string> restore(Index, const std::uint8_t* d, std::size_t n) override {
-        if (n < 12) return "short pipeline snapshot";
+        const std::size_t head = 16 + 8 * std::size_t(partitions_);
+        if (n < head || std::memcmp(d, "PSM2", 4) != 0) return "not a pipeline snapshot (PSM2)";
         Snapshot snap;
-        std::memcpy(&snap.iseq, d, 8);
-        std::memcpy(&snap.partitions, d + 8, 4);
-        snap.body.assign(reinterpret_cast<const char*>(d + 12), n - 12);
+        std::memcpy(&snap.iseq, d + 4, 8);
+        std::memcpy(&snap.partitions, d + 12, 4);
+        if (snap.partitions != partitions_)
+            return "snapshot has " + std::to_string(snap.partitions) + " partitions, this replica runs " + std::to_string(partitions_);
+        std::vector<std::uint64_t> chains(partitions_);
+        for (std::uint32_t i = 0; i < partitions_; ++i) std::memcpy(&chains[i], d + 16 + 8 * std::size_t(i), 8);
+        snap.body.assign(reinterpret_cast<const char*>(d + head), n - head);
         try {
             auto [cfg, cores] = orderer::restore<C>(book_, map_, &snap);
             (void)cfg;
@@ -65,22 +78,51 @@ public:
             Initial<C> init;
             init.cores = std::move(cores);
             init.next_iseq = snap.iseq + 1;
-            pipeline_ = build_(std::move(init));
+            chains_ = EventDigest(partitions_, chains);
+            iseq_ = snap.iseq;
+            pipeline_ = build_(std::move(init), chains_);
         } catch (const std::exception& e) { return e.what(); }
         return std::nullopt;
     }
 
-    std::optional<Digest> digest(Index) override { auto b = encode_state(); return sha256(b); }
-    std::uint64_t bad_entries() const { return bad_entries_; }
+    /// The event-chain digest: O(partitions) after one pipeline barrier.
+    std::optional<Digest> digest(Index) override {
+        pipeline_->drain();
+        std::vector<std::uint8_t> b(DIGEST_TAG, DIGEST_TAG + sizeof DIGEST_TAG - 1);
+        put_u64(b, iseq_);
+        put_u32(b, partitions_);
+        for (std::uint64_t c : chains_.values()) put_u64(b, c);
+        return sha256(b);
+    }
 
-private:
-    std::vector<std::uint8_t> encode_state() {
-        pipeline_->drain();  // egress has seen everything before the snapshot is taken
+    /// The full-state hash: SHA-256 of `iseq | partitions | matcher-snap/1 body`.
+    /// Costs a snapshot of every book.
+    std::optional<Digest> deep_digest(Index) override {
+        pipeline_->drain();
         Snapshot s = pipeline_->snapshot();
         std::vector<std::uint8_t> out;
         out.reserve(12 + s.body.size());
         put_u64(out, s.iseq);
         put_u32(out, s.partitions);
+        out.insert(out.end(), s.body.begin(), s.body.end());
+        return sha256(out);
+    }
+    std::uint64_t bad_entries() const { return bad_entries_; }
+
+private:
+    static constexpr char DIGEST_TAG[] = "orderer-evdigest/1";
+
+    /// Snapshot layout: `PSM2 | iseq u64 | partitions u32 | one chain u64 per
+    /// partition | matcher-snap/1 body`.
+    std::vector<std::uint8_t> encode_snapshot() {
+        pipeline_->drain();  // egress has seen everything before the snapshot is taken
+        Snapshot s = pipeline_->snapshot();
+        const auto chains = chains_.values();
+        std::vector<std::uint8_t> out = {'P', 'S', 'M', '2'};
+        out.reserve(16 + 8 * chains.size() + s.body.size());
+        put_u64(out, s.iseq);
+        put_u32(out, s.partitions);
+        for (std::uint64_t c : chains) put_u64(out, c);
         out.insert(out.end(), s.body.begin(), s.body.end());
         return out;
     }
@@ -88,6 +130,9 @@ private:
     BookConfig book_;
     PartitionMap map_;
     Build build_;
+    std::uint32_t partitions_;
+    EventDigest chains_;
+    std::uint64_t iseq_ = 0;  // commands applied
     std::unique_ptr<Pipeline<C>> pipeline_;
     std::uint64_t bad_entries_ = 0;
 };

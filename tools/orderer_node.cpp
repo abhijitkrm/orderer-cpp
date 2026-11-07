@@ -50,6 +50,7 @@ public:
     std::vector<std::uint8_t> snapshot(Index i) override { return inner_->snapshot(i); }
     std::optional<std::string> restore(Index i, const std::uint8_t* d, std::size_t n) override { return inner_->restore(i, d, n); }
     std::optional<Digest> digest(Index i) override { return inner_->digest(i); }
+    std::optional<Digest> deep_digest(Index i) override { return inner_->deep_digest(i); }
 
 private:
     std::unique_ptr<StateMachine> inner_;
